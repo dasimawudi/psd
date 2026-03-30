@@ -1,0 +1,33 @@
+task: field
+
+dataset:
+  root: case7
+  train_cases: [case0, case1, case2, case3, case4]
+  val_cases: [case5]
+  test_cases: [case6]
+  node_columns: [x, y, z, bc_mask]
+  edge_columns: [dx, dy, dz, dist]
+  target_freq_key: freq_top3
+  make_undirected: true
+  clamp_negative_rmises: true
+
+features:
+  use_psd: true
+
+model:
+  hidden_dim: 64
+  global_dim: 32
+  num_layers: 3
+  dropout: 0.10
+
+training:
+  seed: 42
+  device: auto
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  loss: smooth_l1
+  print_every: 10
+  early_stopping_patience: 50
+  save_dir: outputs/field

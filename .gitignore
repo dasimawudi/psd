@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs / Conda
+.venv/
+venv/
+env/
+.conda-envs/
+
+# IDE
+.idea/
+.vscode/
+
+# Testing / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Training outputs
+outputs/
+logs/
+*.pt
+*.pth
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local datasets and large artifacts
+case7/
+case7.zip
