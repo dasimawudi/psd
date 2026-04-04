@@ -27,8 +27,10 @@ Implemented tasks:
 
 - Only `case0` to `case6` are complete in the current dataset. `case7` is
   incomplete and is skipped automatically.
-- The current dataset contains only 7 valid graphs. This is enough for a code
-  prototype, but not enough for a stable production model.
+- The training pipeline now supports large datasets by loading cases on demand
+  instead of keeping every graph in memory at once.
+- Dataset split can be configured either with explicit case lists or with
+  automatic ratio-based splitting. The default configs use ratio splitting.
 - The current `psd_points` are identical in all valid cases. The code supports
   PSD as an input feature, but the current dataset cannot teach the model how
   different PSD conditions affect the response. To truly learn PSD influence,
@@ -88,6 +90,24 @@ Field task:
 ```powershell
 python train_case7.py --config configs/field.yaml
 ```
+
+For large datasets, the default configs automatically discover complete cases
+under `dataset.root` and split them with:
+
+- `train_ratio`
+- `val_ratio`
+- `test_ratio`
+- `split_seed`
+
+Optional dataset knobs:
+
+- `include_cases`: restrict to a known subset before splitting
+- `exclude_cases`: drop known bad cases before splitting
+- `max_cases`: cap the discovered dataset size for quick experiments
+- `scaler_fit_case_limit`: fit feature scalers on only the first N training
+  cases when a full scaler pass is too slow
+- `cache_dir`: store preprocessed per-case `.pt` files to avoid rereading large
+  CSV files every epoch
 
 Inference after training:
 

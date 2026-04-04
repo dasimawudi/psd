@@ -11,22 +11,18 @@ class StandardScaler:
     mean: torch.Tensor
     std: torch.Tensor
 
+    @staticmethod
+    def _flatten_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dim() == 1:
+            return tensor.unsqueeze(0)
+        return tensor.reshape(-1, tensor.shape[-1])
+
     @classmethod
     def fit(cls, tensors: Iterable[torch.Tensor], eps: float = 1e-6) -> "StandardScaler":
-        flattened = []
+        stats = RunningTensorStats()
         for tensor in tensors:
-            if tensor.dim() == 1:
-                flattened.append(tensor.unsqueeze(0))
-            else:
-                flattened.append(tensor.reshape(-1, tensor.shape[-1]))
-
-        if not flattened:
-            raise ValueError("Cannot fit scaler on an empty tensor collection.")
-
-        data = torch.cat(flattened, dim=0)
-        mean = data.mean(dim=0)
-        std = data.std(dim=0, unbiased=False).clamp_min(eps)
-        return cls(mean=mean, std=std)
+            stats.update(tensor)
+        return stats.finalize(eps=eps)
 
     def transform(self, tensor: torch.Tensor) -> torch.Tensor:
         return (tensor - self.mean) / self.std
@@ -43,6 +39,36 @@ class StandardScaler:
     @classmethod
     def from_state_dict(cls, state: dict[str, torch.Tensor]) -> "StandardScaler":
         return cls(mean=state["mean"], std=state["std"])
+
+
+@dataclass
+class RunningTensorStats:
+    count: int = 0
+    total_sum: torch.Tensor | None = None
+    total_sum_sq: torch.Tensor | None = None
+
+    def update(self, tensor: torch.Tensor) -> None:
+        matrix = StandardScaler._flatten_tensor(tensor).to(dtype=torch.float64)
+
+        if self.total_sum is None or self.total_sum_sq is None:
+            feature_dim = int(matrix.size(-1))
+            self.total_sum = torch.zeros(feature_dim, dtype=torch.float64)
+            self.total_sum_sq = torch.zeros(feature_dim, dtype=torch.float64)
+        elif matrix.size(-1) != self.total_sum.size(0):
+            raise ValueError("Cannot accumulate tensors with inconsistent feature dimensions.")
+
+        self.total_sum += matrix.sum(dim=0)
+        self.total_sum_sq += matrix.pow(2).sum(dim=0)
+        self.count += int(matrix.size(0))
+
+    def finalize(self, eps: float = 1e-6) -> StandardScaler:
+        if self.count == 0 or self.total_sum is None or self.total_sum_sq is None:
+            raise ValueError("Cannot fit scaler on an empty tensor collection.")
+
+        mean = self.total_sum / self.count
+        variance = (self.total_sum_sq / self.count) - mean.pow(2)
+        std = variance.clamp_min(0.0).sqrt().clamp_min(eps)
+        return StandardScaler(mean=mean.to(dtype=torch.float32), std=std.to(dtype=torch.float32))
 
 
 def signed_log1p(tensor: torch.Tensor) -> torch.Tensor:

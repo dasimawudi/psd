@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import csv
 import json
@@ -11,10 +11,11 @@ import random
 import torch
 import torch.nn.functional as F
 
-from case7_gnn.data import build_global_features, load_selected_cases
+from case7_gnn.data import build_global_features, discover_case_index, load_case_graph, resolve_case_splits
 from case7_gnn.models import FieldGNN, FrequencyGNN
 from case7_gnn.runtime import ensure_dir, make_logger, write_json, write_yaml
 from case7_gnn.scalers import (
+    RunningTensorStats,
     StandardScaler,
     decode_field_targets,
     encode_field_targets,
@@ -44,8 +45,8 @@ class PreparedCase:
         )
 
 
-def make_prepared_cases(
-    case_dict: dict[str, Any],
+def prepare_case(
+    case: Any,
     node_scaler: StandardScaler,
     edge_scaler: StandardScaler,
     global_scaler: StandardScaler,
@@ -53,61 +54,85 @@ def make_prepared_cases(
     task: str,
     use_psd: bool,
     clamp_negative_rmises: bool,
-) -> list[PreparedCase]:
-    prepared: list[PreparedCase] = []
-    for name in sorted(case_dict):
-        case = case_dict[name]
-        global_features = global_scaler.transform(build_global_features(case, use_psd=use_psd))
-        node_features = node_scaler.transform(case.node_features)
-        edge_features = edge_scaler.transform(case.edge_features)
-
-        if task == "frequency":
-            target_metric = case.freq_target
-            target_normalized = target_scaler.transform(case.freq_target)
-        elif task == "field":
-            encoded_target = encode_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
-            target_metric = metric_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
-            target_normalized = target_scaler.transform(encoded_target)
-        else:
-            raise ValueError(f"Unsupported task: {task}")
-
-        prepared.append(
-            PreparedCase(
-                name=name,
-                node_features=node_features,
-                edge_index=case.edge_index,
-                edge_features=edge_features,
-                global_features=global_features,
-                target_normalized=target_normalized,
-                target_metric=target_metric,
-            )
-        )
-    return prepared
-
-
-def fit_feature_scalers(
-    train_cases: dict[str, Any],
-    task: str,
-    use_psd: bool,
-    clamp_negative_rmises: bool,
-) -> tuple[StandardScaler, StandardScaler, StandardScaler, StandardScaler]:
-    node_scaler = StandardScaler.fit(case.node_features for case in train_cases.values())
-    edge_scaler = StandardScaler.fit(case.edge_features for case in train_cases.values())
-    global_scaler = StandardScaler.fit(
-        build_global_features(case, use_psd=use_psd) for case in train_cases.values()
-    )
+) -> PreparedCase:
+    global_features = global_scaler.transform(build_global_features(case, use_psd=use_psd))
+    node_features = node_scaler.transform(case.node_features)
+    edge_features = edge_scaler.transform(case.edge_features)
 
     if task == "frequency":
-        target_scaler = StandardScaler.fit(case.freq_target for case in train_cases.values())
+        target_metric = case.freq_target
+        target_normalized = target_scaler.transform(case.freq_target)
     elif task == "field":
-        target_scaler = StandardScaler.fit(
-            encode_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
-            for case in train_cases.values()
-        )
+        encoded_target = encode_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
+        target_metric = metric_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
+        target_normalized = target_scaler.transform(encoded_target)
     else:
         raise ValueError(f"Unsupported task: {task}")
 
-    return node_scaler, edge_scaler, global_scaler, target_scaler
+    return PreparedCase(
+        name=case.name,
+        node_features=node_features,
+        edge_index=case.edge_index,
+        edge_features=edge_features,
+        global_features=global_features,
+        target_normalized=target_normalized,
+        target_metric=target_metric,
+    )
+
+
+def fit_feature_scalers(
+    train_case_paths: list[Path],
+    dataset_cfg: dict[str, Any],
+    task: str,
+    use_psd: bool,
+    clamp_negative_rmises: bool,
+    case_limit: int | None = None,
+) -> tuple[StandardScaler, StandardScaler, StandardScaler, StandardScaler]:
+    selected_paths = list(train_case_paths)
+    if case_limit is not None:
+        case_limit_int = int(case_limit)
+        if case_limit_int <= 0:
+            raise ValueError("scaler_fit_case_limit must be positive when provided.")
+        selected_paths = selected_paths[:case_limit_int]
+
+    if not selected_paths:
+        raise ValueError("Training split is empty; cannot fit feature scalers.")
+
+    cache_dir = dataset_cfg.get("cache_dir")
+    node_stats = RunningTensorStats()
+    edge_stats = RunningTensorStats()
+    global_stats = RunningTensorStats()
+    target_stats = RunningTensorStats()
+
+    for case_path in selected_paths:
+        case = load_case_graph(
+            case_path,
+            node_columns=dataset_cfg["node_columns"],
+            edge_columns=dataset_cfg["edge_columns"],
+            target_freq_key=dataset_cfg["target_freq_key"],
+            make_undirected=bool(dataset_cfg["make_undirected"]),
+            cache_dir=cache_dir,
+        )
+
+        node_stats.update(case.node_features)
+        edge_stats.update(case.edge_features)
+        global_stats.update(build_global_features(case, use_psd=use_psd))
+
+        if task == "frequency":
+            target_stats.update(case.freq_target)
+        elif task == "field":
+            target_stats.update(
+                encode_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
+            )
+        else:
+            raise ValueError(f"Unsupported task: {task}")
+
+    return (
+        node_stats.finalize(),
+        edge_stats.finalize(),
+        global_stats.finalize(),
+        target_stats.finalize(),
+    )
 
 
 def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.Module:
@@ -141,7 +166,8 @@ def compute_loss(prediction: torch.Tensor, target: torch.Tensor, loss_name: str)
 
 def evaluate_frequency(
     model: torch.nn.Module,
-    cases: list[PreparedCase],
+    case_paths: list[Path],
+    case_loader: Callable[[Path], PreparedCase],
     target_scaler: StandardScaler,
     device: torch.device,
     loss_name: str,
@@ -151,11 +177,12 @@ def evaluate_frequency(
     total_count = 0
     abs_sum = 0.0
     sq_sum = 0.0
+    value_count = 0
 
     model.eval()
     with torch.no_grad():
-        for case in cases:
-            batch = case.to(device)
+        for case_path in case_paths:
+            batch = case_loader(case_path).to(device)
             prediction = model(
                 batch.node_features,
                 batch.edge_index,
@@ -171,19 +198,21 @@ def evaluate_frequency(
             error = prediction_hz - target_hz
             abs_sum += error.abs().sum().item()
             sq_sum += error.pow(2).sum().item()
+            value_count += int(target_hz.numel())
 
     denom = max(total_count, 1)
-    value_count = max(len(cases) * int(cases[0].target_metric.numel()), 1) if cases else 1
+    metric_denom = max(value_count, 1)
     return {
         "loss": total_loss / denom,
-        "mae_hz": abs_sum / value_count,
-        "rmse_hz": (sq_sum / value_count) ** 0.5,
+        "mae_hz": abs_sum / metric_denom,
+        "rmse_hz": (sq_sum / metric_denom) ** 0.5,
     }
 
 
 def evaluate_field(
     model: torch.nn.Module,
-    cases: list[PreparedCase],
+    case_paths: list[Path],
+    case_loader: Callable[[Path], PreparedCase],
     target_scaler: StandardScaler,
     clamp_negative_rmises: bool,
     device: torch.device,
@@ -197,8 +226,8 @@ def evaluate_field(
 
     model.eval()
     with torch.no_grad():
-        for case in cases:
-            batch = case.to(device)
+        for case_path in case_paths:
+            batch = case_loader(case_path).to(device)
             prediction = model(
                 batch.node_features,
                 batch.edge_index,
@@ -230,21 +259,22 @@ def evaluate_field(
 
 def train_one_epoch(
     model: torch.nn.Module,
-    cases: list[PreparedCase],
+    case_paths: list[Path],
+    case_loader: Callable[[Path], PreparedCase],
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     loss_name: str,
     grad_clip: float,
 ) -> float:
     model.train()
-    shuffled = list(cases)
+    shuffled = list(case_paths)
     random.shuffle(shuffled)
 
     total_loss = 0.0
     total_weight = 0
 
-    for case in shuffled:
-        batch = case.to(device)
+    for case_path in shuffled:
+        batch = case_loader(case_path).to(device)
         optimizer.zero_grad(set_to_none=True)
         prediction = model(
             batch.node_features,
@@ -290,6 +320,7 @@ class Case7Trainer:
         self.training_cfg = config["training"]
         self.use_psd = bool(config["features"]["use_psd"])
         self.clamp_negative_rmises = bool(self.dataset_cfg.get("clamp_negative_rmises", True))
+        self.cache_dir = self.dataset_cfg.get("cache_dir")
 
         self.save_dir = ensure_dir(self.training_cfg["save_dir"])
         self.logger = make_logger(self.save_dir, logger_name=f"case7_gnn.{self.task}")
@@ -298,36 +329,50 @@ class Case7Trainer:
         self.model: torch.nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scalers: dict[str, StandardScaler] = {}
-        self.train_cases: list[PreparedCase] = []
-        self.val_cases: list[PreparedCase] = []
-        self.test_cases: list[PreparedCase] = []
+        self.case_index: dict[str, Path] = {}
+        self.split_names: dict[str, list[str]] = {}
+        self.train_case_paths: list[Path] = []
+        self.val_case_paths: list[Path] = []
+        self.test_case_paths: list[Path] = []
+        self.resolved_config: dict[str, Any] = {}
 
         self._prepare()
 
-    def _prepare(self) -> None:
-        split_names = (
-            list(self.dataset_cfg["train_cases"])
-            + list(self.dataset_cfg["val_cases"])
-            + list(self.dataset_cfg["test_cases"])
-        )
-        loaded_cases = load_selected_cases(
-            root=self.dataset_cfg["root"],
-            selected_names=split_names,
+    def _load_prepared_case(self, case_path: Path) -> PreparedCase:
+        case = load_case_graph(
+            case_path,
             node_columns=self.dataset_cfg["node_columns"],
             edge_columns=self.dataset_cfg["edge_columns"],
             target_freq_key=self.dataset_cfg["target_freq_key"],
             make_undirected=bool(self.dataset_cfg["make_undirected"]),
+            cache_dir=self.cache_dir,
         )
-
-        train_cases_raw = {name: loaded_cases[name] for name in self.dataset_cfg["train_cases"]}
-        val_cases_raw = {name: loaded_cases[name] for name in self.dataset_cfg["val_cases"]}
-        test_cases_raw = {name: loaded_cases[name] for name in self.dataset_cfg["test_cases"]}
-
-        node_scaler, edge_scaler, global_scaler, target_scaler = fit_feature_scalers(
-            train_cases=train_cases_raw,
+        return prepare_case(
+            case,
+            node_scaler=self.scalers["node"],
+            edge_scaler=self.scalers["edge"],
+            global_scaler=self.scalers["global"],
+            target_scaler=self.scalers["target"],
             task=self.task,
             use_psd=self.use_psd,
             clamp_negative_rmises=self.clamp_negative_rmises,
+        )
+
+    def _prepare(self) -> None:
+        self.case_index = discover_case_index(self.dataset_cfg["root"])
+        self.split_names = resolve_case_splits(self.dataset_cfg["root"], self.dataset_cfg)
+
+        self.train_case_paths = [self.case_index[name] for name in self.split_names["train"]]
+        self.val_case_paths = [self.case_index[name] for name in self.split_names["val"]]
+        self.test_case_paths = [self.case_index[name] for name in self.split_names.get("test", [])]
+
+        node_scaler, edge_scaler, global_scaler, target_scaler = fit_feature_scalers(
+            train_case_paths=self.train_case_paths,
+            dataset_cfg=self.dataset_cfg,
+            task=self.task,
+            use_psd=self.use_psd,
+            clamp_negative_rmises=self.clamp_negative_rmises,
+            case_limit=self.dataset_cfg.get("scaler_fit_case_limit"),
         )
 
         self.scalers = {
@@ -337,60 +382,38 @@ class Case7Trainer:
             "target": target_scaler,
         }
 
-        self.train_cases = make_prepared_cases(
-            train_cases_raw,
-            node_scaler=node_scaler,
-            edge_scaler=edge_scaler,
-            global_scaler=global_scaler,
-            target_scaler=target_scaler,
-            task=self.task,
-            use_psd=self.use_psd,
-            clamp_negative_rmises=self.clamp_negative_rmises,
-        )
-        self.val_cases = make_prepared_cases(
-            val_cases_raw,
-            node_scaler=node_scaler,
-            edge_scaler=edge_scaler,
-            global_scaler=global_scaler,
-            target_scaler=target_scaler,
-            task=self.task,
-            use_psd=self.use_psd,
-            clamp_negative_rmises=self.clamp_negative_rmises,
-        )
-        self.test_cases = make_prepared_cases(
-            test_cases_raw,
-            node_scaler=node_scaler,
-            edge_scaler=edge_scaler,
-            global_scaler=global_scaler,
-            target_scaler=target_scaler,
-            task=self.task,
-            use_psd=self.use_psd,
-            clamp_negative_rmises=self.clamp_negative_rmises,
-        )
-
-        self.model = build_model(self.config, sample_case=self.train_cases[0]).to(self.device)
+        sample_case = self._load_prepared_case(self.train_case_paths[0])
+        self.model = build_model(self.config, sample_case=sample_case).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(self.training_cfg["lr"]),
             weight_decay=float(self.training_cfg["weight_decay"]),
         )
 
-        write_yaml(self.save_dir / "resolved_config.yaml", self.config)
+        resolved_dataset = dict(self.dataset_cfg)
+        resolved_dataset["train_cases"] = list(self.split_names["train"])
+        resolved_dataset["val_cases"] = list(self.split_names["val"])
+        resolved_dataset["test_cases"] = list(self.split_names.get("test", []))
+        self.resolved_config = dict(self.config)
+        self.resolved_config["dataset"] = resolved_dataset
+        write_yaml(self.save_dir / "resolved_config.yaml", self.resolved_config)
 
-    def _evaluate(self, cases: list[PreparedCase], loss_name: str) -> dict[str, float]:
+    def _evaluate(self, case_paths: list[Path], loss_name: str) -> dict[str, float]:
         assert self.model is not None
         target_scaler = self.scalers["target"]
         if self.task == "frequency":
             return evaluate_frequency(
                 model=self.model,
-                cases=cases,
+                case_paths=case_paths,
+                case_loader=self._load_prepared_case,
                 target_scaler=target_scaler,
                 device=self.device,
                 loss_name=loss_name,
             )
         return evaluate_field(
             model=self.model,
-            cases=cases,
+            case_paths=case_paths,
+            case_loader=self._load_prepared_case,
             target_scaler=target_scaler,
             clamp_negative_rmises=self.clamp_negative_rmises,
             device=self.device,
@@ -410,15 +433,24 @@ class Case7Trainer:
         assert self.model is not None
         assert self.optimizer is not None
 
+        eval_every = int(self.training_cfg.get("eval_every", 1))
+        if eval_every <= 0:
+            raise ValueError("training.eval_every must be positive.")
+
         self.logger.info("Task: %s", self.task)
         self.logger.info("Device: %s", self.device)
         self.logger.info(
             "Train/Val/Test graphs: %s/%s/%s",
-            len(self.train_cases),
-            len(self.val_cases),
-            len(self.test_cases),
+            len(self.train_case_paths),
+            len(self.val_case_paths),
+            len(self.test_case_paths),
         )
         self.logger.info("Using PSD features: %s", self.use_psd)
+        self.logger.info("Split mode: %s", self.dataset_cfg.get("split_mode", "explicit"))
+        if self.cache_dir:
+            self.logger.info("Raw case cache: %s", self.cache_dir)
+        if self.dataset_cfg.get("scaler_fit_case_limit") is not None:
+            self.logger.info("Scaler fit case limit: %s", self.dataset_cfg["scaler_fit_case_limit"])
 
         best_val_loss = float("inf")
         best_payload: dict[str, Any] | None = None
@@ -428,22 +460,30 @@ class Case7Trainer:
         for epoch in range(1, int(self.training_cfg["epochs"]) + 1):
             train_loss = train_one_epoch(
                 model=self.model,
-                cases=self.train_cases,
+                case_paths=self.train_case_paths,
+                case_loader=self._load_prepared_case,
                 optimizer=self.optimizer,
                 device=self.device,
                 loss_name=self.training_cfg["loss"],
                 grad_clip=float(self.training_cfg["grad_clip"]),
             )
 
-            val_metrics = self._evaluate(self.val_cases, loss_name=self.training_cfg["loss"])
-            test_metrics = self._evaluate(self.test_cases, loss_name=self.training_cfg["loss"])
-
             history_row = {
                 "epoch": epoch,
                 "train_loss": round(float(train_loss), 8),
-                "val_loss": round(float(val_metrics["loss"]), 8),
-                "test_loss": round(float(test_metrics["loss"]), 8),
             }
+
+            if epoch % eval_every != 0:
+                self._append_history_row(history_row)
+                if epoch == 1 or epoch % int(self.training_cfg["print_every"]) == 0:
+                    self.logger.info("Epoch %04d | train_loss=%.6f | eval=skipped", epoch, train_loss)
+                continue
+
+            val_metrics = self._evaluate(self.val_case_paths, loss_name=self.training_cfg["loss"])
+            test_metrics = self._evaluate(self.test_case_paths, loss_name=self.training_cfg["loss"])
+
+            history_row["val_loss"] = round(float(val_metrics["loss"]), 8)
+            history_row["test_loss"] = round(float(test_metrics["loss"]), 8)
             for key, value in val_metrics.items():
                 if key != "loss":
                     history_row[f"val_{key}"] = round(float(value), 8)
@@ -472,7 +512,7 @@ class Case7Trainer:
                 }
                 _save_checkpoint(
                     save_dir=self.save_dir,
-                    config=self.config,
+                    config=self.resolved_config,
                     model=self.model,
                     scalers=self.scalers,
                     metrics=best_payload,
