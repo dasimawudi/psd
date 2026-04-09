@@ -398,7 +398,12 @@ def load_selected_cases(
     return loaded
 
 
-def build_global_features(case: CaseGraph, use_psd: bool) -> torch.Tensor:
+def build_global_features(case: CaseGraph, use_psd: bool, use_freq_top3: bool = False) -> torch.Tensor:
+    features = [case.params]
     if use_psd:
-        return torch.cat([case.params, case.psd], dim=0)
-    return case.params.clone()
+        features.append(case.psd)
+    if use_freq_top3:
+        features.append(case.freq_target)
+    if len(features) == 1:
+        return case.params.clone()
+    return torch.cat(features, dim=0)

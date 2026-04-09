@@ -53,9 +53,12 @@ def prepare_case(
     target_scaler: StandardScaler,
     task: str,
     use_psd: bool,
+    use_freq_top3: bool,
     clamp_negative_rmises: bool,
 ) -> PreparedCase:
-    global_features = global_scaler.transform(build_global_features(case, use_psd=use_psd))
+    global_features = global_scaler.transform(
+        build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3)
+    )
     node_features = node_scaler.transform(case.node_features)
     edge_features = edge_scaler.transform(case.edge_features)
 
@@ -85,6 +88,7 @@ def fit_feature_scalers(
     dataset_cfg: dict[str, Any],
     task: str,
     use_psd: bool,
+    use_freq_top3: bool,
     clamp_negative_rmises: bool,
     case_limit: int | None = None,
 ) -> tuple[StandardScaler, StandardScaler, StandardScaler, StandardScaler]:
@@ -116,7 +120,7 @@ def fit_feature_scalers(
 
         node_stats.update(case.node_features)
         edge_stats.update(case.edge_features)
-        global_stats.update(build_global_features(case, use_psd=use_psd))
+        global_stats.update(build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3))
 
         if task == "frequency":
             target_stats.update(case.freq_target)
@@ -319,6 +323,7 @@ class Case7Trainer:
         self.dataset_cfg = config["dataset"]
         self.training_cfg = config["training"]
         self.use_psd = bool(config["features"]["use_psd"])
+        self.use_freq_top3 = bool(config["features"].get("use_freq_top3", False))
         self.clamp_negative_rmises = bool(self.dataset_cfg.get("clamp_negative_rmises", True))
         self.cache_dir = self.dataset_cfg.get("cache_dir")
 
@@ -355,6 +360,7 @@ class Case7Trainer:
             target_scaler=self.scalers["target"],
             task=self.task,
             use_psd=self.use_psd,
+            use_freq_top3=self.use_freq_top3,
             clamp_negative_rmises=self.clamp_negative_rmises,
         )
 
@@ -371,6 +377,7 @@ class Case7Trainer:
             dataset_cfg=self.dataset_cfg,
             task=self.task,
             use_psd=self.use_psd,
+            use_freq_top3=self.use_freq_top3,
             clamp_negative_rmises=self.clamp_negative_rmises,
             case_limit=self.dataset_cfg.get("scaler_fit_case_limit"),
         )
@@ -446,6 +453,7 @@ class Case7Trainer:
             len(self.test_case_paths),
         )
         self.logger.info("Using PSD features: %s", self.use_psd)
+        self.logger.info("Using freq_top3 features: %s", self.use_freq_top3)
         self.logger.info("Split mode: %s", self.dataset_cfg.get("split_mode", "explicit"))
         if self.cache_dir:
             self.logger.info("Raw case cache: %s", self.cache_dir)

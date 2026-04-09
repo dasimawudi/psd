@@ -44,6 +44,7 @@ def _prepare_case(
 ) -> tuple[Any, PreparedCase]:
     dataset_cfg = config["dataset"]
     use_psd = bool(config["features"]["use_psd"])
+    use_freq_top3 = bool(config["features"].get("use_freq_top3", False))
     clamp_negative_rmises = bool(dataset_cfg.get("clamp_negative_rmises", True))
 
     case = load_case_graph(
@@ -54,7 +55,9 @@ def _prepare_case(
         make_undirected=bool(dataset_cfg["make_undirected"]),
     )
 
-    global_features = scalers["global"].transform(build_global_features(case, use_psd=use_psd))
+    global_features = scalers["global"].transform(
+        build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3)
+    )
     node_features = scalers["node"].transform(case.node_features)
     edge_features = scalers["edge"].transform(case.edge_features)
 

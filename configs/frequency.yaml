@@ -17,6 +17,7 @@ dataset:
 
 features:
   use_psd: false
+  use_freq_top3: false
 
 model:
   hidden_dim: 64
