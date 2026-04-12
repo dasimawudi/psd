@@ -134,7 +134,7 @@ class GraphEncoder(nn.Module):
         edge_index: torch.Tensor,
         edge_features: torch.Tensor,
         global_features: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         node_state = self.node_encoder(node_features)
         edge_state = self.edge_encoder(edge_features)
         global_state = self.global_encoder(global_features.unsqueeze(0)).squeeze(0)
@@ -145,7 +145,7 @@ class GraphEncoder(nn.Module):
         pooled_mean = node_state.mean(dim=0)
         pooled_max = node_state.max(dim=0).values
         graph_state = torch.cat([pooled_mean, pooled_max, global_state], dim=-1)
-        return node_state, graph_state, global_state
+        return node_state, edge_state, graph_state, global_state
 
 
 class FrequencyGNN(nn.Module):
@@ -186,7 +186,7 @@ class FrequencyGNN(nn.Module):
         edge_features: torch.Tensor,
         global_features: torch.Tensor,
     ) -> torch.Tensor:
-        _, graph_state, _ = self.encoder(node_features, edge_index, edge_features, global_features)
+        _, _, graph_state, _ = self.encoder(node_features, edge_index, edge_features, global_features)
         return self.readout(graph_state)
 
 
@@ -201,8 +201,12 @@ class FieldGNN(nn.Module):
         num_layers: int,
         dropout: float,
         output_dim: int = 2,
+        rmises_refine_layers: int | None = None,
     ) -> None:
         super().__init__()
+        if output_dim != 2:
+            raise ValueError("FieldGNN expects exactly two outputs: RTA and RMises.")
+
         self.encoder = GraphEncoder(
             node_input_dim=node_input_dim,
             edge_input_dim=edge_input_dim,
@@ -212,10 +216,30 @@ class FieldGNN(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
         )
-        self.decoder = build_mlp(
+        self.rta_decoder = build_mlp(
             input_dim=hidden_dim + global_dim,
             hidden_dim=hidden_dim,
-            output_dim=output_dim,
+            output_dim=1,
+            num_layers=3,
+            dropout=dropout,
+            final_activation=False,
+        )
+        refine_layers = rmises_refine_layers if rmises_refine_layers is not None else max(1, num_layers - 1)
+        self.rmises_layers = nn.ModuleList(
+            [
+                EdgeMessagePassingLayer(
+                    hidden_dim=hidden_dim,
+                    edge_dim=hidden_dim,
+                    global_dim=global_dim,
+                    dropout=dropout,
+                )
+                for _ in range(refine_layers)
+            ]
+        )
+        self.rmises_decoder = build_mlp(
+            input_dim=hidden_dim + hidden_dim + global_dim + 1,
+            hidden_dim=hidden_dim,
+            output_dim=1,
             num_layers=3,
             dropout=dropout,
             final_activation=False,
@@ -228,6 +252,20 @@ class FieldGNN(nn.Module):
         edge_features: torch.Tensor,
         global_features: torch.Tensor,
     ) -> torch.Tensor:
-        node_state, _, global_state = self.encoder(node_features, edge_index, edge_features, global_features)
+        node_state, edge_state, _, global_state = self.encoder(
+            node_features,
+            edge_index,
+            edge_features,
+            global_features,
+        )
         global_nodes = global_state.unsqueeze(0).expand(node_state.size(0), -1)
-        return self.decoder(torch.cat([node_state, global_nodes], dim=-1))
+        shared_context = torch.cat([node_state, global_nodes], dim=-1)
+        rta_prediction = self.rta_decoder(shared_context)
+
+        rmises_state = node_state
+        for layer in self.rmises_layers:
+            rmises_state = layer(rmises_state, edge_index, edge_state, global_state)
+
+        rmises_input = torch.cat([node_state, rmises_state, global_nodes, rta_prediction], dim=-1)
+        rmises_prediction = self.rmises_decoder(rmises_input)
+        return torch.cat([rta_prediction, rmises_prediction], dim=-1)

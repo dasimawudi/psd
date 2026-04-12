@@ -23,6 +23,7 @@ model:
   hidden_dim: 64
   global_dim: 32
   num_layers: 3
+  rmises_refine_layers: 2
   dropout: 0.10
 
 training:
@@ -37,3 +38,9 @@ training:
   print_every: 2
   early_stopping_patience: 6
   save_dir: outputs/field
+
+field_loss:
+  rta_loss_weight: 1.0
+  rmises_loss_weight: 2.0
+  rmises_hotspot_alpha: 4.0
+  rmises_hotspot_gamma: 2.0

@@ -156,11 +156,69 @@ def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.M
     if task == "frequency":
         return FrequencyGNN(output_dim=int(sample_case.target_normalized.numel()), **common_kwargs)
     if task == "field":
-        return FieldGNN(output_dim=int(sample_case.target_normalized.size(-1)), **common_kwargs)
+        return FieldGNN(
+            output_dim=int(sample_case.target_normalized.size(-1)),
+            rmises_refine_layers=int(model_cfg.get("rmises_refine_layers", max(1, int(model_cfg["num_layers"]) - 1))),
+            **common_kwargs,
+        )
     raise ValueError(f"Unsupported task: {task}")
 
 
-def compute_loss(prediction: torch.Tensor, target: torch.Tensor, loss_name: str) -> torch.Tensor:
+def compute_pointwise_loss(prediction: torch.Tensor, target: torch.Tensor, loss_name: str) -> torch.Tensor:
+    if loss_name == "mse":
+        return (prediction - target).pow(2)
+    if loss_name == "smooth_l1":
+        return F.smooth_l1_loss(prediction, target, reduction="none")
+    raise ValueError(f"Unsupported loss: {loss_name}")
+
+
+def compute_field_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_metric: torch.Tensor,
+    loss_name: str,
+    field_loss_cfg: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    cfg = field_loss_cfg or {}
+    rta_loss_weight = float(cfg.get("rta_loss_weight", 1.0))
+    rmises_loss_weight = float(cfg.get("rmises_loss_weight", 1.0))
+    rmises_hotspot_alpha = float(cfg.get("rmises_hotspot_alpha", 0.0))
+    rmises_hotspot_gamma = float(cfg.get("rmises_hotspot_gamma", 2.0))
+
+    pointwise = compute_pointwise_loss(prediction, target, loss_name=loss_name)
+    rta_loss = pointwise[:, 0]
+    rmises_loss = pointwise[:, 1]
+
+    rmises_values = target_metric[:, 1].clamp_min(0.0)
+    rmises_log = torch.log1p(rmises_values)
+    max_log = rmises_log.max()
+    if max_log.item() > 0.0:
+        hotspot_score = (rmises_log / max_log).pow(rmises_hotspot_gamma)
+    else:
+        hotspot_score = torch.zeros_like(rmises_log)
+    rmises_weights = 1.0 + rmises_hotspot_alpha * hotspot_score
+
+    return (rta_loss_weight * rta_loss.mean()) + (rmises_loss_weight * (rmises_loss * rmises_weights).mean())
+
+
+def compute_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    loss_name: str,
+    task: str = "frequency",
+    target_metric: torch.Tensor | None = None,
+    field_loss_cfg: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    if task == "field":
+        if target_metric is None:
+            raise ValueError("Field loss requires target_metric for hotspot weighting.")
+        return compute_field_loss(
+            prediction,
+            target,
+            target_metric=target_metric,
+            loss_name=loss_name,
+            field_loss_cfg=field_loss_cfg,
+        )
     if loss_name == "mse":
         return F.mse_loss(prediction, target)
     if loss_name == "smooth_l1":
@@ -221,6 +279,7 @@ def evaluate_field(
     clamp_negative_rmises: bool,
     device: torch.device,
     loss_name: str,
+    field_loss_cfg: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     scaler = target_scaler.to(device)
     total_loss = 0.0
@@ -238,7 +297,14 @@ def evaluate_field(
                 batch.edge_features,
                 batch.global_features,
             )
-            loss = compute_loss(prediction, batch.target_normalized, loss_name=loss_name)
+            loss = compute_loss(
+                prediction,
+                batch.target_normalized,
+                loss_name=loss_name,
+                task="field",
+                target_metric=batch.target_metric,
+                field_loss_cfg=field_loss_cfg,
+            )
             node_count = int(batch.node_features.size(0))
             total_loss += loss.item() * node_count
             total_nodes += node_count
@@ -269,6 +335,8 @@ def train_one_epoch(
     device: torch.device,
     loss_name: str,
     grad_clip: float,
+    task: str = "frequency",
+    field_loss_cfg: dict[str, Any] | None = None,
 ) -> float:
     model.train()
     shuffled = list(case_paths)
@@ -286,7 +354,14 @@ def train_one_epoch(
             batch.edge_features,
             batch.global_features,
         )
-        loss = compute_loss(prediction, batch.target_normalized, loss_name=loss_name)
+        loss = compute_loss(
+            prediction,
+            batch.target_normalized,
+            loss_name=loss_name,
+            task=task,
+            target_metric=batch.target_metric if task == "field" else None,
+            field_loss_cfg=field_loss_cfg,
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
@@ -322,6 +397,7 @@ class Case7Trainer:
         self.task = config["task"]
         self.dataset_cfg = config["dataset"]
         self.training_cfg = config["training"]
+        self.field_loss_cfg = dict(config.get("field_loss", {}))
         self.use_psd = bool(config["features"]["use_psd"])
         self.use_freq_top3 = bool(config["features"].get("use_freq_top3", False))
         self.clamp_negative_rmises = bool(self.dataset_cfg.get("clamp_negative_rmises", True))
@@ -425,6 +501,7 @@ class Case7Trainer:
             clamp_negative_rmises=self.clamp_negative_rmises,
             device=self.device,
             loss_name=loss_name,
+            field_loss_cfg=self.field_loss_cfg,
         )
 
     def _append_history_row(self, row: dict[str, Any]) -> None:
@@ -454,6 +531,8 @@ class Case7Trainer:
         )
         self.logger.info("Using PSD features: %s", self.use_psd)
         self.logger.info("Using freq_top3 features: %s", self.use_freq_top3)
+        if self.task == "field" and self.field_loss_cfg:
+            self.logger.info("Field loss config: %s", json.dumps(self.field_loss_cfg, ensure_ascii=False))
         self.logger.info("Split mode: %s", self.dataset_cfg.get("split_mode", "explicit"))
         if self.cache_dir:
             self.logger.info("Raw case cache: %s", self.cache_dir)
@@ -474,6 +553,8 @@ class Case7Trainer:
                 device=self.device,
                 loss_name=self.training_cfg["loss"],
                 grad_clip=float(self.training_cfg["grad_clip"]),
+                task=self.task,
+                field_loss_cfg=self.field_loss_cfg,
             )
 
             history_row = {
