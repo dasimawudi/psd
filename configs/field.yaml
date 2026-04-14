@@ -25,6 +25,9 @@ model:
   num_layers: 3
   rmises_refine_layers: 2
   dropout: 0.10
+  conditioning:
+    enabled: true
+    case_dim: 48
 
 training:
   seed: 42

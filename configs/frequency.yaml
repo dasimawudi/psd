@@ -24,6 +24,9 @@ model:
   global_dim: 32
   num_layers: 3
   dropout: 0.10
+  conditioning:
+    enabled: true
+    case_dim: 48
 
 training:
   seed: 42

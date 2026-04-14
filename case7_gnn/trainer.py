@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 import csv
 import json
+import math
 import random
 
 import torch
@@ -142,6 +143,8 @@ def fit_feature_scalers(
 def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.Module:
     task = config["task"]
     model_cfg = config["model"]
+    conditioning_cfg = dict(model_cfg.get("conditioning", {}))
+    conditioning_enabled = bool(conditioning_cfg.get("enabled", False))
 
     common_kwargs = dict(
         node_input_dim=int(sample_case.node_features.size(-1)),
@@ -151,6 +154,8 @@ def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.M
         global_dim=int(model_cfg["global_dim"]),
         num_layers=int(model_cfg["num_layers"]),
         dropout=float(model_cfg["dropout"]),
+        conditioning_dim=int(conditioning_cfg.get("case_dim", model_cfg["global_dim"])),
+        enable_conditioning=conditioning_enabled,
     )
 
     if task == "frequency":
@@ -184,6 +189,17 @@ def compute_field_loss(
     rmises_loss_weight = float(cfg.get("rmises_loss_weight", 1.0))
     rmises_hotspot_alpha = float(cfg.get("rmises_hotspot_alpha", 0.0))
     rmises_hotspot_gamma = float(cfg.get("rmises_hotspot_gamma", 2.0))
+    rmises_noise_floor = float(cfg.get("rmises_noise_floor", 0.0))
+    rmises_low_value_weight = float(cfg.get("rmises_low_value_weight", 1.0))
+    rmises_hotspot_quantile = float(cfg.get("rmises_hotspot_quantile", 0.0))
+    rmises_hotspot_boost = float(cfg.get("rmises_hotspot_boost", 0.0))
+    rmises_topk_ratio = float(cfg.get("rmises_topk_ratio", 0.0))
+    rmises_topk_weight = float(cfg.get("rmises_topk_weight", 0.0))
+    rmises_case_activity_quantile = float(cfg.get("rmises_case_activity_quantile", 0.0))
+    rmises_case_activity_reference = float(cfg.get("rmises_case_activity_reference", 1.0))
+    rmises_case_activity_power = float(cfg.get("rmises_case_activity_power", 1.0))
+    rmises_case_activity_min_weight = float(cfg.get("rmises_case_activity_min_weight", 1.0))
+    rmises_case_activity_max_weight = float(cfg.get("rmises_case_activity_max_weight", 1.0))
 
     pointwise = compute_pointwise_loss(prediction, target, loss_name=loss_name)
     rta_loss = pointwise[:, 0]
@@ -191,14 +207,55 @@ def compute_field_loss(
 
     rmises_values = target_metric[:, 1].clamp_min(0.0)
     rmises_log = torch.log1p(rmises_values)
-    max_log = rmises_log.max()
-    if max_log.item() > 0.0:
-        hotspot_score = (rmises_log / max_log).pow(rmises_hotspot_gamma)
-    else:
-        hotspot_score = torch.zeros_like(rmises_log)
-    rmises_weights = 1.0 + rmises_hotspot_alpha * hotspot_score
+    # RMises is extremely long-tailed: suppress near-zero noise, then boost hotspot nodes and active cases.
+    rmises_weights = torch.full_like(rmises_loss, fill_value=rmises_low_value_weight)
 
-    return (rta_loss_weight * rta_loss.mean()) + (rmises_loss_weight * (rmises_loss * rmises_weights).mean())
+    active_mask = rmises_values > rmises_noise_floor
+    if active_mask.any():
+        active_log = rmises_log[active_mask]
+        active_max_log = active_log.max()
+        if active_max_log.item() > 0.0:
+            hotspot_score = (active_log / active_max_log).pow(rmises_hotspot_gamma)
+        else:
+            hotspot_score = torch.zeros_like(active_log)
+        rmises_weights[active_mask] = 1.0 + rmises_hotspot_alpha * hotspot_score
+
+        if 0.0 < rmises_hotspot_quantile < 1.0 and rmises_hotspot_boost > 0.0:
+            hotspot_threshold = torch.quantile(rmises_values[active_mask], rmises_hotspot_quantile)
+            hotspot_mask = active_mask & (rmises_values >= hotspot_threshold)
+            rmises_weights = rmises_weights + hotspot_mask.to(dtype=rmises_weights.dtype) * rmises_hotspot_boost
+
+    rmises_case_weight = 1.0
+    if 0.0 < rmises_case_activity_quantile < 1.0:
+        if active_mask.any():
+            case_activity_value = torch.quantile(rmises_values[active_mask], rmises_case_activity_quantile)
+            reference_log = math.log1p(max(rmises_case_activity_reference, 1e-12))
+            if reference_log > 0.0:
+                activity_ratio = torch.log1p(case_activity_value) / reference_log
+                rmises_case_weight = float(
+                    torch.clamp(
+                        activity_ratio.pow(rmises_case_activity_power),
+                        min=rmises_case_activity_min_weight,
+                        max=rmises_case_activity_max_weight,
+                    ).item()
+                )
+            else:
+                rmises_case_weight = rmises_case_activity_max_weight
+        else:
+            rmises_case_weight = max(rmises_case_activity_min_weight, 0.0)
+
+    base_rmises_loss = (rmises_loss * rmises_weights).mean()
+    extra_hotspot_loss = rmises_loss.new_zeros(())
+    if rmises_topk_ratio > 0.0 and rmises_topk_weight > 0.0 and active_mask.any():
+        active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+        topk_count = min(active_indices.numel(), max(1, int(math.ceil(active_indices.numel() * rmises_topk_ratio))))
+        _, topk_order = torch.topk(rmises_values[active_indices], k=topk_count, largest=True, sorted=False)
+        topk_indices = active_indices[topk_order]
+        extra_hotspot_loss = rmises_loss[topk_indices].mean() * rmises_topk_weight
+
+    return (rta_loss_weight * rta_loss.mean()) + (
+        rmises_loss_weight * rmises_case_weight * (base_rmises_loss + extra_hotspot_loss)
+    )
 
 
 def compute_loss(
@@ -531,6 +588,10 @@ class Case7Trainer:
         )
         self.logger.info("Using PSD features: %s", self.use_psd)
         self.logger.info("Using freq_top3 features: %s", self.use_freq_top3)
+        self.logger.info(
+            "Case conditioning: %s",
+            bool(self.config.get("model", {}).get("conditioning", {}).get("enabled", False)),
+        )
         if self.task == "field" and self.field_loss_cfg:
             self.logger.info("Field loss config: %s", json.dumps(self.field_loss_cfg, ensure_ascii=False))
         self.logger.info("Split mode: %s", self.dataset_cfg.get("split_mode", "explicit"))

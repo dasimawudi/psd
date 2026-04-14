@@ -22,6 +22,11 @@ Implemented tasks:
    Output:
    - per-node `RTA`
    - per-node `RMises`
+   - The field model now uses a dual-head design with an extra RMises-specific
+     refinement branch to better capture localized stress hotspots.
+   - The encoder now also supports an optional case-conditioning path that
+     compresses global geometry/load priors into a latent vector and uses it to
+     modulate message passing and decoder features.
 
 ## Important notes
 
@@ -41,6 +46,8 @@ Implemented tasks:
 - `RMises` contains some small negative values in the raw data. By default, the
   field task clamps negative `RMises` to zero before applying the label
   transform.
+- The field task can apply an RMises hotspot-weighted loss so high-stress
+  regions contribute more strongly during training.
 
 ## Environment
 
@@ -108,6 +115,11 @@ Optional dataset knobs:
   cases when a full scaler pass is too slow
 - `cache_dir`: store preprocessed per-case `.pt` files to avoid rereading large
   CSV files every epoch
+
+Optional model knobs:
+
+- `model.conditioning.enabled`: turn on case-level latent conditioning
+- `model.conditioning.case_dim`: latent width used to encode global priors
 
 Inference after training:
 
