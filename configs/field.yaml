@@ -47,3 +47,11 @@ field_loss:
   rmises_loss_weight: 2.0
   rmises_hotspot_alpha: 4.0
   rmises_hotspot_gamma: 2.0
+
+rmises_two_stage:
+  enabled: true
+  threshold: 25.0
+  prob_threshold: 0.5
+  classification_weight: 1.0
+  regression_weight: 2.0
+  positive_class_weight: 20.0

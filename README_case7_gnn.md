@@ -27,6 +27,9 @@ Implemented tasks:
    - The encoder now also supports an optional case-conditioning path that
      compresses global geometry/load priors into a latent vector and uses it to
      modulate message passing and decoder features.
+   - RMises can also run in an optional two-stage mode: classify hotspot nodes
+     first, then regress only the hotspot intensity above a configured stress
+     threshold.
 
 ## Important notes
 
@@ -121,6 +124,15 @@ Optional model knobs:
 - `model.conditioning.enabled`: turn on case-level latent conditioning
 - `model.conditioning.case_dim`: latent width used to encode global priors
 
+Optional RMises two-stage knobs:
+
+- `rmises_two_stage.enabled`: enable hotspot classification + hotspot-strength regression
+- `rmises_two_stage.threshold`: hotspot threshold in raw RMises units
+- `rmises_two_stage.prob_threshold`: probability threshold used at inference time
+- `rmises_two_stage.classification_weight`: classification loss weight
+- `rmises_two_stage.regression_weight`: hotspot regression loss weight
+- `rmises_two_stage.positive_class_weight`: positive-class reweighting for hotspot BCE
+
 Inference after training:
 
 ```powershell
@@ -142,6 +154,8 @@ Inference writes:
 
 - `frequency_prediction.json` for the frequency task
 - `field_prediction.csv` and `field_prediction_summary.json` for the field task
+- in two-stage RMises mode, `field_prediction.csv` also includes
+  `pred_hotspot_prob` and `pred_hotspot_label`
 
 ## Default assumption
 

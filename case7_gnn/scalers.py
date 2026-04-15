@@ -79,26 +79,79 @@ def signed_expm1(tensor: torch.Tensor) -> torch.Tensor:
     return torch.sign(tensor) * torch.expm1(torch.abs(tensor))
 
 
-def encode_field_targets(targets: torch.Tensor, clamp_negative_rmises: bool) -> torch.Tensor:
-    rta = torch.log1p(targets[:, 0].clamp_min(0.0))
-    rmises_raw = targets[:, 1]
+def metric_rmises_targets(targets: torch.Tensor, clamp_negative_rmises: bool) -> torch.Tensor:
+    rmises = targets[:, 1]
     if clamp_negative_rmises:
-        rmises = torch.log1p(rmises_raw.clamp_min(0.0))
-    else:
-        rmises = signed_log1p(rmises_raw)
+        rmises = rmises.clamp_min(0.0)
+    return rmises
+
+
+def encode_rmises_targets(
+    rmises_targets: torch.Tensor,
+    clamp_negative_rmises: bool,
+    as_excess: bool = False,
+    threshold: float = 0.0,
+) -> torch.Tensor:
+    if as_excess:
+        rmises_metric = (rmises_targets - threshold).clamp_min(0.0)
+        return torch.log1p(rmises_metric)
+
+    if clamp_negative_rmises:
+        return torch.log1p(rmises_targets.clamp_min(0.0))
+    return signed_log1p(rmises_targets)
+
+
+def decode_rmises_targets(
+    encoded_rmises: torch.Tensor,
+    clamp_negative_rmises: bool,
+    as_excess: bool = False,
+    threshold: float = 0.0,
+) -> torch.Tensor:
+    if as_excess:
+        return torch.expm1(encoded_rmises).clamp_min(0.0)
+
+    if clamp_negative_rmises:
+        return torch.expm1(encoded_rmises).clamp_min(0.0)
+    return signed_expm1(encoded_rmises)
+
+
+def build_rmises_hotspot_targets(rmises_targets: torch.Tensor, threshold: float) -> torch.Tensor:
+    return (rmises_targets >= threshold).to(dtype=torch.float32)
+
+
+def encode_field_targets(
+    targets: torch.Tensor,
+    clamp_negative_rmises: bool,
+    rmises_as_excess: bool = False,
+    rmises_threshold: float = 0.0,
+) -> torch.Tensor:
+    rta = torch.log1p(targets[:, 0].clamp_min(0.0))
+    rmises = encode_rmises_targets(
+        metric_rmises_targets(targets, clamp_negative_rmises=clamp_negative_rmises),
+        clamp_negative_rmises=clamp_negative_rmises,
+        as_excess=rmises_as_excess,
+        threshold=rmises_threshold,
+    )
     return torch.stack([rta, rmises], dim=-1)
 
 
-def decode_field_targets(encoded: torch.Tensor, clamp_negative_rmises: bool) -> torch.Tensor:
+def decode_field_targets(
+    encoded: torch.Tensor,
+    clamp_negative_rmises: bool,
+    rmises_as_excess: bool = False,
+    rmises_threshold: float = 0.0,
+) -> torch.Tensor:
     rta = torch.expm1(encoded[:, 0]).clamp_min(0.0)
-    if clamp_negative_rmises:
-        rmises = torch.expm1(encoded[:, 1]).clamp_min(0.0)
-    else:
-        rmises = signed_expm1(encoded[:, 1])
+    rmises = decode_rmises_targets(
+        encoded[:, 1],
+        clamp_negative_rmises=clamp_negative_rmises,
+        as_excess=rmises_as_excess,
+        threshold=rmises_threshold,
+    )
     return torch.stack([rta, rmises], dim=-1)
 
 
 def metric_field_targets(targets: torch.Tensor, clamp_negative_rmises: bool) -> torch.Tensor:
     rta = targets[:, 0].clamp_min(0.0)
-    rmises = targets[:, 1].clamp_min(0.0) if clamp_negative_rmises else targets[:, 1]
+    rmises = metric_rmises_targets(targets, clamp_negative_rmises=clamp_negative_rmises)
     return torch.stack([rta, rmises], dim=-1)

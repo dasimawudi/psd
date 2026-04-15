@@ -13,11 +13,10 @@ from case7_gnn.data import build_global_features, load_case_graph
 from case7_gnn.runtime import ensure_dir, read_config, resolve_device, write_json
 from case7_gnn.scalers import (
     StandardScaler,
-    decode_field_targets,
     encode_field_targets,
     metric_field_targets,
 )
-from case7_gnn.trainer import PreparedCase, build_model
+from case7_gnn.trainer import PreparedCase, build_model, decode_field_prediction, get_two_stage_rmises_cfg
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +42,7 @@ def _prepare_case(
     scalers: dict[str, StandardScaler],
 ) -> tuple[Any, PreparedCase]:
     dataset_cfg = config["dataset"]
+    two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
     use_psd = bool(config["features"]["use_psd"])
     use_freq_top3 = bool(config["features"].get("use_freq_top3", False))
     clamp_negative_rmises = bool(dataset_cfg.get("clamp_negative_rmises", True))
@@ -53,6 +53,7 @@ def _prepare_case(
         edge_columns=dataset_cfg["edge_columns"],
         target_freq_key=dataset_cfg["target_freq_key"],
         make_undirected=bool(dataset_cfg["make_undirected"]),
+        cache_dir=dataset_cfg.get("cache_dir"),
     )
 
     global_features = scalers["global"].transform(
@@ -67,7 +68,12 @@ def _prepare_case(
     else:
         target_metric = metric_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
         target_normalized = scalers["target"].transform(
-            encode_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
+            encode_field_targets(
+                case.node_targets,
+                clamp_negative_rmises=clamp_negative_rmises,
+                rmises_as_excess=bool(two_stage_rmises_cfg["enabled"]),
+                rmises_threshold=float(two_stage_rmises_cfg["threshold"]),
+            )
         )
 
     prepared = PreparedCase(
@@ -125,31 +131,38 @@ def main() -> None:
         return
 
     clamp_negative_rmises = bool(config["dataset"].get("clamp_negative_rmises", True))
-    prediction_encoded = target_scaler.inverse_transform(prediction).detach().cpu()
-    prediction_raw = decode_field_targets(
-        prediction_encoded,
+    two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
+    prediction_raw, hotspot_prob, hotspot_mask = decode_field_prediction(
+        prediction=prediction,
+        target_scaler=target_scaler,
         clamp_negative_rmises=clamp_negative_rmises,
+        two_stage_rmises_cfg=two_stage_rmises_cfg,
     )
+    prediction_raw = prediction_raw.detach().cpu()
 
     node_count = raw_case.node_features.size(0)
-    output_df = pd.DataFrame(
-        {
-            "node_id": list(range(node_count)),
-            "x": raw_case.node_features[:, 0].cpu().numpy(),
-            "y": raw_case.node_features[:, 1].cpu().numpy(),
-            "z": raw_case.node_features[:, 2].cpu().numpy(),
-            "pred_RTA": prediction_raw[:, 0].cpu().numpy(),
-            "pred_RMises": prediction_raw[:, 1].cpu().numpy(),
-            "actual_RTA": raw_case.node_targets[:, 0].cpu().numpy(),
-            "actual_RMises": raw_case.node_targets[:, 1].cpu().numpy(),
-        }
-    )
+    columns: dict[str, Any] = {
+        "node_id": list(range(node_count)),
+        "x": raw_case.node_features[:, 0].cpu().numpy(),
+        "y": raw_case.node_features[:, 1].cpu().numpy(),
+        "z": raw_case.node_features[:, 2].cpu().numpy(),
+        "pred_RTA": prediction_raw[:, 0].cpu().numpy(),
+        "pred_RMises": prediction_raw[:, 1].cpu().numpy(),
+        "actual_RTA": raw_case.node_targets[:, 0].cpu().numpy(),
+        "actual_RMises": raw_case.node_targets[:, 1].cpu().numpy(),
+    }
+    if bool(two_stage_rmises_cfg["enabled"]):
+        assert hotspot_prob is not None and hotspot_mask is not None
+        columns["pred_hotspot_prob"] = hotspot_prob.detach().cpu().numpy()
+        columns["pred_hotspot_label"] = hotspot_mask.detach().cpu().to(dtype=torch.int32).numpy()
+    output_df = pd.DataFrame(columns)
     output_df.to_csv(output_dir / "field_prediction.csv", index=False)
     summary = {
         "case": raw_case.name,
         "task": "field",
         "rows": int(len(output_df)),
         "output_csv": str(output_dir / "field_prediction.csv"),
+        "two_stage_rmises": bool(two_stage_rmises_cfg["enabled"]),
     }
     write_json(output_dir / "field_prediction_summary.json", summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False))

@@ -18,6 +18,7 @@ from case7_gnn.runtime import ensure_dir, make_logger, write_json, write_yaml
 from case7_gnn.scalers import (
     RunningTensorStats,
     StandardScaler,
+    build_rmises_hotspot_targets,
     decode_field_targets,
     encode_field_targets,
     metric_field_targets,
@@ -46,6 +47,50 @@ class PreparedCase:
         )
 
 
+def get_two_stage_rmises_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    raw_cfg = dict(config.get("rmises_two_stage", {}))
+    return {
+        "enabled": bool(raw_cfg.get("enabled", False)),
+        "threshold": float(raw_cfg.get("threshold", 25.0)),
+        "prob_threshold": float(raw_cfg.get("prob_threshold", 0.5)),
+        "classification_weight": float(raw_cfg.get("classification_weight", 1.0)),
+        "regression_weight": float(raw_cfg.get("regression_weight", 2.0)),
+        "positive_class_weight": float(raw_cfg.get("positive_class_weight", 10.0)),
+    }
+
+
+def decode_field_prediction(
+    prediction: torch.Tensor,
+    target_scaler: StandardScaler,
+    clamp_negative_rmises: bool,
+    two_stage_rmises_cfg: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if two_stage_rmises_cfg["enabled"]:
+        encoded_pair = target_scaler.inverse_transform(torch.stack([prediction[:, 0], prediction[:, 2]], dim=-1))
+        decoded_pair = decode_field_targets(
+            encoded_pair,
+            clamp_negative_rmises=clamp_negative_rmises,
+            rmises_as_excess=True,
+            rmises_threshold=float(two_stage_rmises_cfg["threshold"]),
+        )
+        hotspot_prob = torch.sigmoid(prediction[:, 1])
+        hotspot_mask = hotspot_prob >= float(two_stage_rmises_cfg["prob_threshold"])
+        final_rmises = torch.where(
+            hotspot_mask,
+            decoded_pair[:, 1] + float(two_stage_rmises_cfg["threshold"]),
+            torch.zeros_like(decoded_pair[:, 1]),
+        )
+        final_prediction = torch.stack([decoded_pair[:, 0], final_rmises], dim=-1)
+        return final_prediction, hotspot_prob, hotspot_mask
+
+    prediction_encoded = target_scaler.inverse_transform(prediction)
+    prediction_raw = decode_field_targets(
+        prediction_encoded,
+        clamp_negative_rmises=clamp_negative_rmises,
+    )
+    return prediction_raw, None, None
+
+
 def prepare_case(
     case: Any,
     node_scaler: StandardScaler,
@@ -56,7 +101,9 @@ def prepare_case(
     use_psd: bool,
     use_freq_top3: bool,
     clamp_negative_rmises: bool,
+    two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> PreparedCase:
+    two_stage_cfg = two_stage_rmises_cfg or {"enabled": False, "threshold": 0.0}
     global_features = global_scaler.transform(
         build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3)
     )
@@ -67,7 +114,12 @@ def prepare_case(
         target_metric = case.freq_target
         target_normalized = target_scaler.transform(case.freq_target)
     elif task == "field":
-        encoded_target = encode_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
+        encoded_target = encode_field_targets(
+            case.node_targets,
+            clamp_negative_rmises=clamp_negative_rmises,
+            rmises_as_excess=bool(two_stage_cfg["enabled"]),
+            rmises_threshold=float(two_stage_cfg["threshold"]),
+        )
         target_metric = metric_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
         target_normalized = target_scaler.transform(encoded_target)
     else:
@@ -92,7 +144,9 @@ def fit_feature_scalers(
     use_freq_top3: bool,
     clamp_negative_rmises: bool,
     case_limit: int | None = None,
+    two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> tuple[StandardScaler, StandardScaler, StandardScaler, StandardScaler]:
+    two_stage_cfg = two_stage_rmises_cfg or {"enabled": False, "threshold": 0.0}
     selected_paths = list(train_case_paths)
     if case_limit is not None:
         case_limit_int = int(case_limit)
@@ -127,7 +181,12 @@ def fit_feature_scalers(
             target_stats.update(case.freq_target)
         elif task == "field":
             target_stats.update(
-                encode_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
+                encode_field_targets(
+                    case.node_targets,
+                    clamp_negative_rmises=clamp_negative_rmises,
+                    rmises_as_excess=bool(two_stage_cfg["enabled"]),
+                    rmises_threshold=float(two_stage_cfg["threshold"]),
+                )
             )
         else:
             raise ValueError(f"Unsupported task: {task}")
@@ -145,6 +204,7 @@ def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.M
     model_cfg = config["model"]
     conditioning_cfg = dict(model_cfg.get("conditioning", {}))
     conditioning_enabled = bool(conditioning_cfg.get("enabled", False))
+    two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
 
     common_kwargs = dict(
         node_input_dim=int(sample_case.node_features.size(-1)),
@@ -164,6 +224,7 @@ def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.M
         return FieldGNN(
             output_dim=int(sample_case.target_normalized.size(-1)),
             rmises_refine_layers=int(model_cfg.get("rmises_refine_layers", max(1, int(model_cfg["num_layers"]) - 1))),
+            use_two_stage_rmises=bool(two_stage_rmises_cfg["enabled"]),
             **common_kwargs,
         )
     raise ValueError(f"Unsupported task: {task}")
@@ -183,9 +244,41 @@ def compute_field_loss(
     target_metric: torch.Tensor,
     loss_name: str,
     field_loss_cfg: dict[str, Any] | None = None,
+    two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> torch.Tensor:
+    two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
     cfg = field_loss_cfg or {}
     rta_loss_weight = float(cfg.get("rta_loss_weight", 1.0))
+
+    if bool(two_stage_cfg["enabled"]):
+        rta_loss = compute_pointwise_loss(prediction[:, 0], target[:, 0], loss_name=loss_name).mean()
+        hotspot_target = build_rmises_hotspot_targets(
+            target_metric[:, 1],
+            threshold=float(two_stage_cfg["threshold"]),
+        )
+        pos_weight = prediction.new_tensor(float(two_stage_cfg["positive_class_weight"]))
+        hotspot_cls_loss = F.binary_cross_entropy_with_logits(
+            prediction[:, 1],
+            hotspot_target,
+            pos_weight=pos_weight,
+        )
+
+        hotspot_mask = hotspot_target > 0.5
+        if hotspot_mask.any():
+            hotspot_reg_loss = compute_pointwise_loss(
+                prediction[hotspot_mask, 2],
+                target[hotspot_mask, 1],
+                loss_name=loss_name,
+            ).mean()
+        else:
+            hotspot_reg_loss = prediction.new_zeros(())
+
+        return (
+            rta_loss_weight * rta_loss
+            + float(two_stage_cfg["classification_weight"]) * hotspot_cls_loss
+            + float(two_stage_cfg["regression_weight"]) * hotspot_reg_loss
+        )
+
     rmises_loss_weight = float(cfg.get("rmises_loss_weight", 1.0))
     rmises_hotspot_alpha = float(cfg.get("rmises_hotspot_alpha", 0.0))
     rmises_hotspot_gamma = float(cfg.get("rmises_hotspot_gamma", 2.0))
@@ -265,6 +358,7 @@ def compute_loss(
     task: str = "frequency",
     target_metric: torch.Tensor | None = None,
     field_loss_cfg: dict[str, Any] | None = None,
+    two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     if task == "field":
         if target_metric is None:
@@ -275,6 +369,7 @@ def compute_loss(
             target_metric=target_metric,
             loss_name=loss_name,
             field_loss_cfg=field_loss_cfg,
+            two_stage_rmises_cfg=two_stage_rmises_cfg,
         )
     if loss_name == "mse":
         return F.mse_loss(prediction, target)
@@ -337,12 +432,19 @@ def evaluate_field(
     device: torch.device,
     loss_name: str,
     field_loss_cfg: dict[str, Any] | None = None,
+    two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> dict[str, float]:
+    two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
     scaler = target_scaler.to(device)
     total_loss = 0.0
     total_nodes = 0
     total_rta_abs = 0.0
     total_rmises_abs = 0.0
+    total_hotspot_tp = 0.0
+    total_hotspot_fp = 0.0
+    total_hotspot_fn = 0.0
+    total_hotspot_abs = 0.0
+    total_hotspot_nodes = 0
 
     model.eval()
     with torch.no_grad():
@@ -361,27 +463,53 @@ def evaluate_field(
                 task="field",
                 target_metric=batch.target_metric,
                 field_loss_cfg=field_loss_cfg,
+                two_stage_rmises_cfg=two_stage_cfg,
             )
             node_count = int(batch.node_features.size(0))
             total_loss += loss.item() * node_count
             total_nodes += node_count
 
-            prediction_encoded = scaler.inverse_transform(prediction).detach().cpu()
-            prediction_raw = decode_field_targets(
-                prediction_encoded,
+            prediction_raw, hotspot_prob, hotspot_mask = decode_field_prediction(
+                prediction=prediction,
+                target_scaler=scaler,
                 clamp_negative_rmises=clamp_negative_rmises,
+                two_stage_rmises_cfg=two_stage_cfg,
             )
+            prediction_raw = prediction_raw.detach().cpu()
             target_raw = batch.target_metric.detach().cpu()
             error = (prediction_raw - target_raw).abs()
             total_rta_abs += error[:, 0].sum().item()
             total_rmises_abs += error[:, 1].sum().item()
 
+            if bool(two_stage_cfg["enabled"]):
+                assert hotspot_prob is not None and hotspot_mask is not None
+                target_hotspot = build_rmises_hotspot_targets(
+                    target_raw[:, 1],
+                    threshold=float(two_stage_cfg["threshold"]),
+                ).to(dtype=torch.bool)
+                pred_hotspot = hotspot_mask.detach().cpu().to(dtype=torch.bool)
+                total_hotspot_tp += float((pred_hotspot & target_hotspot).sum().item())
+                total_hotspot_fp += float((pred_hotspot & ~target_hotspot).sum().item())
+                total_hotspot_fn += float((~pred_hotspot & target_hotspot).sum().item())
+                if target_hotspot.any():
+                    total_hotspot_abs += error[target_hotspot, 1].sum().item()
+                    total_hotspot_nodes += int(target_hotspot.sum().item())
+
     denom = max(total_nodes, 1)
-    return {
+    metrics = {
         "loss": total_loss / denom,
         "rta_mae": total_rta_abs / denom,
         "rmises_mae": total_rmises_abs / denom,
     }
+    if bool(two_stage_cfg["enabled"]):
+        precision = total_hotspot_tp / max(total_hotspot_tp + total_hotspot_fp, 1.0)
+        recall = total_hotspot_tp / max(total_hotspot_tp + total_hotspot_fn, 1.0)
+        f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
+        metrics["rmises_hotspot_mae"] = total_hotspot_abs / max(total_hotspot_nodes, 1)
+        metrics["hotspot_precision"] = precision
+        metrics["hotspot_recall"] = recall
+        metrics["hotspot_f1"] = f1
+    return metrics
 
 
 def train_one_epoch(
@@ -394,6 +522,7 @@ def train_one_epoch(
     grad_clip: float,
     task: str = "frequency",
     field_loss_cfg: dict[str, Any] | None = None,
+    two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> float:
     model.train()
     shuffled = list(case_paths)
@@ -418,6 +547,7 @@ def train_one_epoch(
             task=task,
             target_metric=batch.target_metric if task == "field" else None,
             field_loss_cfg=field_loss_cfg,
+            two_stage_rmises_cfg=two_stage_rmises_cfg,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -455,6 +585,7 @@ class Case7Trainer:
         self.dataset_cfg = config["dataset"]
         self.training_cfg = config["training"]
         self.field_loss_cfg = dict(config.get("field_loss", {}))
+        self.two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
         self.use_psd = bool(config["features"]["use_psd"])
         self.use_freq_top3 = bool(config["features"].get("use_freq_top3", False))
         self.clamp_negative_rmises = bool(self.dataset_cfg.get("clamp_negative_rmises", True))
@@ -495,6 +626,7 @@ class Case7Trainer:
             use_psd=self.use_psd,
             use_freq_top3=self.use_freq_top3,
             clamp_negative_rmises=self.clamp_negative_rmises,
+            two_stage_rmises_cfg=self.two_stage_rmises_cfg,
         )
 
     def _prepare(self) -> None:
@@ -513,6 +645,7 @@ class Case7Trainer:
             use_freq_top3=self.use_freq_top3,
             clamp_negative_rmises=self.clamp_negative_rmises,
             case_limit=self.dataset_cfg.get("scaler_fit_case_limit"),
+            two_stage_rmises_cfg=self.two_stage_rmises_cfg,
         )
 
         self.scalers = {
@@ -559,6 +692,7 @@ class Case7Trainer:
             device=self.device,
             loss_name=loss_name,
             field_loss_cfg=self.field_loss_cfg,
+            two_stage_rmises_cfg=self.two_stage_rmises_cfg,
         )
 
     def _append_history_row(self, row: dict[str, Any]) -> None:
@@ -592,6 +726,10 @@ class Case7Trainer:
             "Case conditioning: %s",
             bool(self.config.get("model", {}).get("conditioning", {}).get("enabled", False)),
         )
+        if self.task == "field":
+            self.logger.info("Two-stage RMises: %s", bool(self.two_stage_rmises_cfg["enabled"]))
+            if self.two_stage_rmises_cfg["enabled"]:
+                self.logger.info("Two-stage RMises config: %s", json.dumps(self.two_stage_rmises_cfg, ensure_ascii=False))
         if self.task == "field" and self.field_loss_cfg:
             self.logger.info("Field loss config: %s", json.dumps(self.field_loss_cfg, ensure_ascii=False))
         self.logger.info("Split mode: %s", self.dataset_cfg.get("split_mode", "explicit"))
@@ -616,6 +754,7 @@ class Case7Trainer:
                 grad_clip=float(self.training_cfg["grad_clip"]),
                 task=self.task,
                 field_loss_cfg=self.field_loss_cfg,
+                two_stage_rmises_cfg=self.two_stage_rmises_cfg,
             )
 
             history_row = {

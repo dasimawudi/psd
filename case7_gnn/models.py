@@ -292,12 +292,14 @@ class FieldGNN(nn.Module):
         rmises_refine_layers: int | None = None,
         conditioning_dim: int | None = None,
         enable_conditioning: bool = False,
+        use_two_stage_rmises: bool = False,
     ) -> None:
         super().__init__()
         if output_dim != 2:
             raise ValueError("FieldGNN expects exactly two outputs: RTA and RMises.")
 
         self.enable_conditioning = enable_conditioning
+        self.use_two_stage_rmises = use_two_stage_rmises
         self.encoder = GraphEncoder(
             node_input_dim=node_input_dim,
             edge_input_dim=edge_input_dim,
@@ -330,24 +332,60 @@ class FieldGNN(nn.Module):
                 for _ in range(refine_layers)
             ]
         )
-        self.rmises_decoder = build_mlp(
-            input_dim=hidden_dim + hidden_dim + global_dim + 1,
-            hidden_dim=hidden_dim,
-            output_dim=1,
-            num_layers=3,
-            dropout=dropout,
-            final_activation=False,
-        )
         self.rta_context_modulation = (
             FeatureModulation(feature_dim=hidden_dim + global_dim, conditioning_dim=conditioning_dim)
             if enable_conditioning and conditioning_dim is not None
             else None
         )
-        self.rmises_context_modulation = (
-            FeatureModulation(feature_dim=hidden_dim + hidden_dim + global_dim + 1, conditioning_dim=conditioning_dim)
-            if enable_conditioning and conditioning_dim is not None
-            else None
-        )
+        if self.use_two_stage_rmises:
+            self.hotspot_decoder = build_mlp(
+                input_dim=hidden_dim + hidden_dim + global_dim + 1,
+                hidden_dim=hidden_dim,
+                output_dim=1,
+                num_layers=3,
+                dropout=dropout,
+                final_activation=False,
+            )
+            self.rmises_decoder = build_mlp(
+                input_dim=hidden_dim + hidden_dim + global_dim + 1 + 1,
+                hidden_dim=hidden_dim,
+                output_dim=1,
+                num_layers=3,
+                dropout=dropout,
+                final_activation=False,
+            )
+            self.hotspot_context_modulation = (
+                FeatureModulation(
+                    feature_dim=hidden_dim + hidden_dim + global_dim + 1,
+                    conditioning_dim=conditioning_dim,
+                )
+                if enable_conditioning and conditioning_dim is not None
+                else None
+            )
+            self.rmises_context_modulation = (
+                FeatureModulation(
+                    feature_dim=hidden_dim + hidden_dim + global_dim + 1 + 1,
+                    conditioning_dim=conditioning_dim,
+                )
+                if enable_conditioning and conditioning_dim is not None
+                else None
+            )
+        else:
+            self.hotspot_decoder = None
+            self.rmises_decoder = build_mlp(
+                input_dim=hidden_dim + hidden_dim + global_dim + 1,
+                hidden_dim=hidden_dim,
+                output_dim=1,
+                num_layers=3,
+                dropout=dropout,
+                final_activation=False,
+            )
+            self.hotspot_context_modulation = None
+            self.rmises_context_modulation = (
+                FeatureModulation(feature_dim=hidden_dim + hidden_dim + global_dim + 1, conditioning_dim=conditioning_dim)
+                if enable_conditioning and conditioning_dim is not None
+                else None
+            )
 
     def forward(
         self,
@@ -373,7 +411,23 @@ class FieldGNN(nn.Module):
         for layer in self.rmises_layers:
             rmises_state = layer(rmises_state, edge_index, edge_state, global_state, conditioning_state)
 
-        rmises_input = torch.cat([node_state, rmises_state, global_nodes, rta_prediction], dim=-1)
+        base_rmises_context = torch.cat([node_state, rmises_state, global_nodes, rta_prediction], dim=-1)
+        if self.use_two_stage_rmises:
+            hotspot_input = base_rmises_context
+            if self.hotspot_context_modulation is not None:
+                assert conditioning_state is not None
+                hotspot_input = self.hotspot_context_modulation(hotspot_input, conditioning_state)
+            assert self.hotspot_decoder is not None
+            hotspot_logit = self.hotspot_decoder(hotspot_input)
+
+            rmises_input = torch.cat([base_rmises_context, hotspot_logit], dim=-1)
+            if self.rmises_context_modulation is not None:
+                assert conditioning_state is not None
+                rmises_input = self.rmises_context_modulation(rmises_input, conditioning_state)
+            rmises_prediction = self.rmises_decoder(rmises_input)
+            return torch.cat([rta_prediction, hotspot_logit, rmises_prediction], dim=-1)
+
+        rmises_input = base_rmises_context
         if self.rmises_context_modulation is not None:
             assert conditioning_state is not None
             rmises_input = self.rmises_context_modulation(rmises_input, conditioning_state)
