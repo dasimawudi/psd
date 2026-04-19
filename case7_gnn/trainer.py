@@ -31,6 +31,8 @@ class PreparedCase:
     node_features: torch.Tensor
     edge_index: torch.Tensor
     edge_features: torch.Tensor
+    node_bc_mask: torch.Tensor
+    edge_distance: torch.Tensor
     global_features: torch.Tensor
     target_normalized: torch.Tensor
     target_metric: torch.Tensor
@@ -41,6 +43,8 @@ class PreparedCase:
             node_features=self.node_features.to(device),
             edge_index=self.edge_index.to(device),
             edge_features=self.edge_features.to(device),
+            node_bc_mask=self.node_bc_mask.to(device),
+            edge_distance=self.edge_distance.to(device),
             global_features=self.global_features.to(device),
             target_normalized=self.target_normalized.to(device),
             target_metric=self.target_metric.to(device),
@@ -57,6 +61,98 @@ def get_two_stage_rmises_cfg(config: dict[str, Any]) -> dict[str, Any]:
         "regression_weight": float(raw_cfg.get("regression_weight", 2.0)),
         "positive_class_weight": float(raw_cfg.get("positive_class_weight", 10.0)),
     }
+
+
+def _column_index(column_names: list[str] | tuple[str, ...] | Any, target_name: str) -> int | None:
+    names = list(column_names)
+    try:
+        return names.index(target_name)
+    except ValueError:
+        return None
+
+
+def _extract_node_bc_mask(case: Any, node_columns: list[str] | tuple[str, ...] | Any) -> torch.Tensor:
+    bc_index = _column_index(node_columns, "bc_mask")
+    if bc_index is None:
+        return torch.zeros(case.node_features.size(0), dtype=case.node_features.dtype)
+    return case.node_features[:, bc_index]
+
+
+def _extract_edge_distance(case: Any, edge_columns: list[str] | tuple[str, ...] | Any) -> torch.Tensor:
+    dist_index = _column_index(edge_columns, "dist")
+    if dist_index is None:
+        return torch.ones(case.edge_features.size(0), dtype=case.edge_features.dtype)
+    return case.edge_features[:, dist_index].abs()
+
+
+def build_augmented_node_features(
+    case: Any,
+    node_columns: list[str] | tuple[str, ...] | Any,
+    feature_cfg: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    cfg = feature_cfg or {}
+    if not bool(cfg.get("augment_node_physics", False)):
+        return case.node_features
+
+    x_index = _column_index(node_columns, "x")
+    y_index = _column_index(node_columns, "y")
+    z_index = _column_index(node_columns, "z")
+    if x_index is None or y_index is None or z_index is None:
+        raise ValueError("augment_node_physics requires x, y, z in dataset.node_columns")
+
+    x = case.node_features[:, x_index : x_index + 1]
+    y = case.node_features[:, y_index : y_index + 1]
+    z = case.node_features[:, z_index : z_index + 1]
+
+    plate_radius = case.params[6].clamp_min(1e-6)
+    earpiece_radial_dist = case.params[1]
+    earpiece_width = case.params[2].clamp_min(1e-6)
+    earpiece_hole_top_dist = case.params[3]
+    thickness = case.params[0].clamp_min(1e-6)
+
+    r = torch.sqrt(x.pow(2) + y.pow(2) + 1e-12)
+    theta = torch.atan2(y, x)
+    x_norm = x / plate_radius
+    y_norm = y / plate_radius
+    z_norm = z / plate_radius
+    z_thickness_norm = z / thickness
+    r_norm = r / plate_radius
+    dist_to_edge = (plate_radius - r) / plate_radius
+
+    # Approximate the earpiece attachment center along the +x radial direction.
+    earpiece_center_x = x.new_full((x.size(0), 1), float(earpiece_radial_dist))
+    earpiece_center_y = y.new_zeros((y.size(0), 1))
+    earpiece_center_z = z.new_full((z.size(0), 1), float(earpiece_hole_top_dist))
+    dist_to_earpiece = torch.sqrt(
+        (x - earpiece_center_x).pow(2)
+        + (y - earpiece_center_y).pow(2)
+        + (z - earpiece_center_z).pow(2)
+        + 1e-12
+    ) / plate_radius
+    radial_offset_to_earpiece = (r - earpiece_radial_dist) / plate_radius
+
+    boundary_band_ratio = float(cfg.get("boundary_band_ratio", 0.08))
+    earpiece_band_ratio = float(cfg.get("earpiece_band_ratio", 0.12))
+    near_boundary = (dist_to_edge <= boundary_band_ratio).to(dtype=case.node_features.dtype)
+    near_earpiece = (dist_to_earpiece <= max(earpiece_band_ratio, float(earpiece_width / plate_radius))).to(
+        dtype=case.node_features.dtype
+    )
+
+    physics_features = [
+        x_norm,
+        y_norm,
+        z_norm,
+        z_thickness_norm,
+        r_norm,
+        dist_to_edge,
+        torch.sin(theta),
+        torch.cos(theta),
+        dist_to_earpiece,
+        radial_offset_to_earpiece,
+        near_boundary,
+        near_earpiece,
+    ]
+    return torch.cat([case.node_features] + physics_features, dim=-1)
 
 
 def decode_field_prediction(
@@ -101,14 +197,21 @@ def prepare_case(
     use_psd: bool,
     use_freq_top3: bool,
     clamp_negative_rmises: bool,
+    node_columns: list[str] | tuple[str, ...] | Any,
+    edge_columns: list[str] | tuple[str, ...] | Any,
+    feature_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> PreparedCase:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False, "threshold": 0.0}
     global_features = global_scaler.transform(
         build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3)
     )
-    node_features = node_scaler.transform(case.node_features)
+    node_features = node_scaler.transform(
+        build_augmented_node_features(case, node_columns=node_columns, feature_cfg=feature_cfg)
+    )
     edge_features = edge_scaler.transform(case.edge_features)
+    node_bc_mask = _extract_node_bc_mask(case, node_columns=node_columns)
+    edge_distance = _extract_edge_distance(case, edge_columns=edge_columns)
 
     if task == "frequency":
         target_metric = case.freq_target
@@ -130,6 +233,8 @@ def prepare_case(
         node_features=node_features,
         edge_index=case.edge_index,
         edge_features=edge_features,
+        node_bc_mask=node_bc_mask,
+        edge_distance=edge_distance,
         global_features=global_features,
         target_normalized=target_normalized,
         target_metric=target_metric,
@@ -143,6 +248,7 @@ def fit_feature_scalers(
     use_psd: bool,
     use_freq_top3: bool,
     clamp_negative_rmises: bool,
+    feature_cfg: dict[str, Any] | None = None,
     case_limit: int | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> tuple[StandardScaler, StandardScaler, StandardScaler, StandardScaler]:
@@ -173,7 +279,13 @@ def fit_feature_scalers(
             cache_dir=cache_dir,
         )
 
-        node_stats.update(case.node_features)
+        node_stats.update(
+            build_augmented_node_features(
+                case,
+                node_columns=dataset_cfg["node_columns"],
+                feature_cfg=feature_cfg,
+            )
+        )
         edge_stats.update(case.edge_features)
         global_stats.update(build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3))
 
@@ -242,6 +354,7 @@ def compute_field_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     target_metric: torch.Tensor,
+    batch: PreparedCase | None,
     loss_name: str,
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
@@ -249,6 +362,43 @@ def compute_field_loss(
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
     cfg = field_loss_cfg or {}
     rta_loss_weight = float(cfg.get("rta_loss_weight", 1.0))
+    physics_rta_smoothness_weight = float(cfg.get("physics_rta_smoothness_weight", 0.0))
+    physics_rmises_smoothness_weight = float(cfg.get("physics_rmises_smoothness_weight", 0.0))
+    physics_distance_power = float(cfg.get("physics_distance_power", 1.0))
+    physics_exclude_boundary_edges = bool(cfg.get("physics_exclude_boundary_edges", True))
+    physics_hotspot_exempt_quantile = float(cfg.get("physics_hotspot_exempt_quantile", 0.98))
+
+    physics_loss = prediction.new_zeros(())
+    if batch is not None and (
+        physics_rta_smoothness_weight > 0.0 or physics_rmises_smoothness_weight > 0.0
+    ):
+        src, dst = batch.edge_index
+        edge_mask = torch.ones(src.size(0), dtype=torch.bool, device=prediction.device)
+        if physics_exclude_boundary_edges:
+            non_boundary = batch.node_bc_mask < 0.5
+            edge_mask = edge_mask & non_boundary[src] & non_boundary[dst]
+
+        rmises_metric = target_metric[:, 1].clamp_min(0.0)
+        if 0.0 < physics_hotspot_exempt_quantile < 1.0 and rmises_metric.numel() > 0:
+            hotspot_threshold = torch.quantile(rmises_metric, physics_hotspot_exempt_quantile)
+            hotspot_nodes = rmises_metric >= hotspot_threshold
+            edge_mask = edge_mask & ~(hotspot_nodes[src] | hotspot_nodes[dst])
+
+        if edge_mask.any():
+            edge_distance = batch.edge_distance.clamp_min(1e-6).pow(physics_distance_power)
+            edge_norm = edge_distance[edge_mask]
+            if physics_rta_smoothness_weight > 0.0:
+                rta_edge_residual = (prediction[src, 0] - prediction[dst, 0]).pow(2)
+                physics_loss = physics_loss + physics_rta_smoothness_weight * (
+                    rta_edge_residual[edge_mask] / edge_norm
+                ).mean()
+
+            rmises_channel = 2 if bool(two_stage_cfg["enabled"]) else 1
+            if physics_rmises_smoothness_weight > 0.0:
+                rmises_edge_residual = (prediction[src, rmises_channel] - prediction[dst, rmises_channel]).pow(2)
+                physics_loss = physics_loss + physics_rmises_smoothness_weight * (
+                    rmises_edge_residual[edge_mask] / edge_norm
+                ).mean()
 
     if bool(two_stage_cfg["enabled"]):
         rta_loss = compute_pointwise_loss(prediction[:, 0], target[:, 0], loss_name=loss_name).mean()
@@ -277,6 +427,7 @@ def compute_field_loss(
             rta_loss_weight * rta_loss
             + float(two_stage_cfg["classification_weight"]) * hotspot_cls_loss
             + float(two_stage_cfg["regression_weight"]) * hotspot_reg_loss
+            + physics_loss
         )
 
     rmises_loss_weight = float(cfg.get("rmises_loss_weight", 1.0))
@@ -348,7 +499,7 @@ def compute_field_loss(
 
     return (rta_loss_weight * rta_loss.mean()) + (
         rmises_loss_weight * rmises_case_weight * (base_rmises_loss + extra_hotspot_loss)
-    )
+    ) + physics_loss
 
 
 def compute_loss(
@@ -357,6 +508,7 @@ def compute_loss(
     loss_name: str,
     task: str = "frequency",
     target_metric: torch.Tensor | None = None,
+    batch: PreparedCase | None = None,
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
 ) -> torch.Tensor:
@@ -367,6 +519,7 @@ def compute_loss(
             prediction,
             target,
             target_metric=target_metric,
+            batch=batch,
             loss_name=loss_name,
             field_loss_cfg=field_loss_cfg,
             two_stage_rmises_cfg=two_stage_rmises_cfg,
@@ -462,6 +615,7 @@ def evaluate_field(
                 loss_name=loss_name,
                 task="field",
                 target_metric=batch.target_metric,
+                batch=batch,
                 field_loss_cfg=field_loss_cfg,
                 two_stage_rmises_cfg=two_stage_cfg,
             )
@@ -546,6 +700,7 @@ def train_one_epoch(
             loss_name=loss_name,
             task=task,
             target_metric=batch.target_metric if task == "field" else None,
+            batch=batch if task == "field" else None,
             field_loss_cfg=field_loss_cfg,
             two_stage_rmises_cfg=two_stage_rmises_cfg,
         )
@@ -586,8 +741,9 @@ class Case7Trainer:
         self.training_cfg = config["training"]
         self.field_loss_cfg = dict(config.get("field_loss", {}))
         self.two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
-        self.use_psd = bool(config["features"]["use_psd"])
-        self.use_freq_top3 = bool(config["features"].get("use_freq_top3", False))
+        self.feature_cfg = dict(config.get("features", {}))
+        self.use_psd = bool(self.feature_cfg["use_psd"])
+        self.use_freq_top3 = bool(self.feature_cfg.get("use_freq_top3", False))
         self.clamp_negative_rmises = bool(self.dataset_cfg.get("clamp_negative_rmises", True))
         self.cache_dir = self.dataset_cfg.get("cache_dir")
 
@@ -626,6 +782,9 @@ class Case7Trainer:
             use_psd=self.use_psd,
             use_freq_top3=self.use_freq_top3,
             clamp_negative_rmises=self.clamp_negative_rmises,
+            node_columns=self.dataset_cfg["node_columns"],
+            edge_columns=self.dataset_cfg["edge_columns"],
+            feature_cfg=self.feature_cfg,
             two_stage_rmises_cfg=self.two_stage_rmises_cfg,
         )
 
@@ -644,6 +803,7 @@ class Case7Trainer:
             use_psd=self.use_psd,
             use_freq_top3=self.use_freq_top3,
             clamp_negative_rmises=self.clamp_negative_rmises,
+            feature_cfg=self.feature_cfg,
             case_limit=self.dataset_cfg.get("scaler_fit_case_limit"),
             two_stage_rmises_cfg=self.two_stage_rmises_cfg,
         )
@@ -722,6 +882,10 @@ class Case7Trainer:
         )
         self.logger.info("Using PSD features: %s", self.use_psd)
         self.logger.info("Using freq_top3 features: %s", self.use_freq_top3)
+        self.logger.info(
+            "Physics node feature augmentation: %s",
+            bool(self.feature_cfg.get("augment_node_physics", False)),
+        )
         self.logger.info(
             "Case conditioning: %s",
             bool(self.config.get("model", {}).get("conditioning", {}).get("enabled", False)),

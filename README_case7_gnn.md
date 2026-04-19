@@ -51,6 +51,9 @@ Implemented tasks:
   transform.
 - The field task can apply an RMises hotspot-weighted loss so high-stress
   regions contribute more strongly during training.
+- The field task also supports optional physics-aware node feature augmentation
+  and an edge-smoothness prior in the loss. A ready-to-run example is provided
+  in `configs/field_physics.yaml`.
 
 ## Environment
 
@@ -101,6 +104,12 @@ Field task:
 python train_case7.py --config configs/field.yaml
 ```
 
+Field task with physics-aware features and loss:
+
+```powershell
+python train_case7.py --config configs/field_physics.yaml
+```
+
 For large datasets, the default configs automatically discover complete cases
 under `dataset.root` and split them with:
 
@@ -123,6 +132,25 @@ Optional model knobs:
 
 - `model.conditioning.enabled`: turn on case-level latent conditioning
 - `model.conditioning.case_dim`: latent width used to encode global priors
+
+Optional physics-aware feature knobs:
+
+- `features.augment_node_physics`: append derived geometry priors to node inputs
+- `features.boundary_band_ratio`: normalized boundary band used for the
+  near-boundary indicator
+- `features.earpiece_band_ratio`: normalized earpiece band used for the
+  near-earpiece indicator
+
+Optional physics-aware field loss knobs:
+
+- `field_loss.physics_rta_smoothness_weight`: edge-based RTA smoothness prior
+- `field_loss.physics_rmises_smoothness_weight`: edge-based RMises smoothness prior
+- `field_loss.physics_distance_power`: distance normalization power for the
+  smoothness term
+- `field_loss.physics_exclude_boundary_edges`: skip edges touching constrained
+  nodes when applying the smoothness prior
+- `field_loss.physics_hotspot_exempt_quantile`: exempt the top-stress nodes
+  from smoothness regularization to avoid flattening true hotspots
 
 Optional RMises two-stage knobs:
 
