@@ -7,6 +7,7 @@ from typing import Any, Iterable, Sequence
 import json
 import math
 import random
+import re
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,11 @@ import torch
 DEFAULT_NODE_COLUMNS = ("x", "y", "z", "bc_mask")
 DEFAULT_EDGE_COLUMNS = ("dx", "dy", "dz", "dist")
 DEFAULT_NODE_TARGET_COLUMNS = ("RTA", "RMises")
+PER_FREQUENCY_DIRNAME = "per_frequency_mises"
+PER_FREQUENCY_TARGET_COLUMN = "MISES_psd_density"
+FINAL_RMISES_FILENAME = "final_rmises.csv"
+FINAL_RMISES_COLUMN = "RMises_native"
+FRAME_FREQUENCY_PATTERN = re.compile(r"_(\d+(?:\.\d+)?)Hz$")
 
 
 @dataclass
@@ -27,6 +33,7 @@ class CaseGraph:
     params: torch.Tensor
     psd: torch.Tensor
     freq_target: torch.Tensor
+    frequency_scalar: torch.Tensor
     node_targets: torch.Tensor
 
     @property
@@ -73,9 +80,15 @@ def _flatten_psd_points(psd_points: Sequence[Sequence[float]]) -> list[float]:
     return flattened
 
 
-def _load_global_json(case_dir: Path, target_freq_key: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    payload = json.loads((case_dir / "global.json").read_text(encoding="utf-8"))
+def _load_global_payload(case_dir: Path) -> dict[str, Any]:
+    return json.loads((case_dir / "global.json").read_text(encoding="utf-8"))
 
+
+def _load_global_json(
+    payload: dict[str, Any],
+    case_dir: Path,
+    target_freq_key: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if "params_list" not in payload:
         raise KeyError(f"{case_dir} is missing params_list")
     if "psd_points" not in payload:
@@ -89,14 +102,145 @@ def _load_global_json(case_dir: Path, target_freq_key: str) -> tuple[torch.Tenso
     return params, psd, freq_target
 
 
-def _load_nodes(case_dir: Path, node_columns: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
-    usecols = list(node_columns) + list(DEFAULT_NODE_TARGET_COLUMNS)
-    nodes_df = pd.read_csv(case_dir / "nodes.csv", usecols=usecols)
-    node_features = torch.tensor(nodes_df[list(node_columns)].to_numpy(dtype=np.float32), dtype=torch.float32)
-    node_targets = torch.tensor(
-        nodes_df[list(DEFAULT_NODE_TARGET_COLUMNS)].to_numpy(dtype=np.float32),
-        dtype=torch.float32,
+def _extract_param_value(payload: dict[str, Any], key: str, fallback_index: int | None = None) -> float | None:
+    params = payload.get("params", {})
+    if key in params:
+        return float(params[key])
+    params_list = payload.get("params_list", [])
+    if fallback_index is not None and fallback_index < len(params_list):
+        return float(params_list[fallback_index])
+    return None
+
+
+def _generate_boundary_mask(nodes_df: pd.DataFrame, payload: dict[str, Any]) -> np.ndarray:
+    fixed_geometry = payload.get("fixed_geometry", {})
+    earpiece_count = int(fixed_geometry.get("earpiece_Count_default", 0))
+    earpiece_hole_radius = float(fixed_geometry.get("earpiece_HoleRadius", 0.0))
+    plate_thickness = float(fixed_geometry.get("plate_thickness", 0.0))
+    earpiece_radial_dist = _extract_param_value(payload, "earpiece_RadialDist", fallback_index=1)
+
+    if earpiece_count <= 0 or earpiece_hole_radius <= 0.0 or earpiece_radial_dist is None:
+        return np.zeros(len(nodes_df), dtype=np.float32)
+
+    xy = nodes_df[["x", "y"]].to_numpy(dtype=np.float32)
+    z = nodes_df["z"].to_numpy(dtype=np.float32)
+    angles = np.linspace(0.0, 2.0 * math.pi, num=earpiece_count, endpoint=False, dtype=np.float32)
+    centers = np.stack(
+        [
+            -float(earpiece_radial_dist) * np.sin(angles),
+            float(earpiece_radial_dist) * np.cos(angles),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+    xy_delta = xy[:, None, :] - centers[None, :, :]
+    radial_distance = np.sqrt(np.sum(np.square(xy_delta), axis=-1))
+    hole_radius = np.float32(earpiece_hole_radius * 1.1)
+    in_hole = radial_distance <= hole_radius
+    in_z_range = (z >= -1.0) & (z <= (plate_thickness + 1.0))
+    return (in_hole.any(axis=1) & in_z_range).astype(np.float32, copy=False)
+
+
+def _load_aligned_target_column(
+    target_df: pd.DataFrame,
+    target_column: str,
+    nodes_df: pd.DataFrame,
+    target_path: Path,
+) -> np.ndarray:
+    if target_column not in target_df.columns:
+        raise KeyError(f"{target_path} is missing {target_column}")
+
+    if "node_index" in nodes_df.columns and "node_index" in target_df.columns:
+        merged = nodes_df[["node_index"]].merge(
+            target_df[["node_index", target_column]],
+            on="node_index",
+            how="left",
+            sort=False,
+        )
+        if merged[target_column].isna().any():
+            missing_count = int(merged[target_column].isna().sum())
+            raise ValueError(f"{target_path} is missing {missing_count} node targets after aligning by node_index")
+        return merged[target_column].to_numpy(dtype=np.float32)
+
+    values = target_df[target_column].to_numpy(dtype=np.float32)
+    if values.shape[0] != len(nodes_df):
+        raise ValueError(f"{target_path} row count {values.shape[0]} does not match nodes.csv row count {len(nodes_df)}")
+    return values
+
+
+def _stack_field_targets(primary: np.ndarray) -> torch.Tensor:
+    rta = np.zeros_like(primary, dtype=np.float32)
+    return torch.tensor(np.stack([rta, primary], axis=-1), dtype=torch.float32)
+
+
+def _load_final_rmises_targets(case_dir: Path, nodes_df: pd.DataFrame) -> torch.Tensor:
+    target_path = case_dir / FINAL_RMISES_FILENAME
+    target_df = pd.read_csv(target_path)
+    rmises = _load_aligned_target_column(target_df, FINAL_RMISES_COLUMN, nodes_df=nodes_df, target_path=target_path)
+    return _stack_field_targets(rmises)
+
+
+def _load_per_frequency_targets(target_path: Path, nodes_df: pd.DataFrame) -> torch.Tensor:
+    target_df = pd.read_csv(target_path)
+    mises_psd_density = _load_aligned_target_column(
+        target_df,
+        PER_FREQUENCY_TARGET_COLUMN,
+        nodes_df=nodes_df,
+        target_path=target_path,
     )
+    return _stack_field_targets(mises_psd_density)
+
+
+def _resolve_case_and_target_path(sample_path: Path) -> tuple[Path, Path | None]:
+    if sample_path.is_dir():
+        return sample_path, None
+    if sample_path.is_file() and sample_path.parent.name == PER_FREQUENCY_DIRNAME:
+        return sample_path.parent.parent, sample_path
+    raise ValueError(f"Unsupported sample path: {sample_path}")
+
+
+def _load_frequency_scalar(target_path: Path | None) -> torch.Tensor:
+    if target_path is None:
+        return torch.empty(0, dtype=torch.float32)
+    match = FRAME_FREQUENCY_PATTERN.search(target_path.stem)
+    if match is None:
+        raise ValueError(f"Could not parse frequency value from frame filename: {target_path.name}")
+    return torch.tensor([float(match.group(1))], dtype=torch.float32)
+
+
+def _load_nodes(
+    case_dir: Path,
+    node_columns: Sequence[str],
+    global_payload: dict[str, Any],
+    target_path: Path | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    nodes_df = pd.read_csv(case_dir / "nodes.csv")
+
+    feature_arrays: list[np.ndarray] = []
+    for column in node_columns:
+        if column in nodes_df.columns:
+            feature_arrays.append(nodes_df[column].to_numpy(dtype=np.float32))
+            continue
+        if column == "bc_mask":
+            feature_arrays.append(_generate_boundary_mask(nodes_df, global_payload))
+            continue
+        raise KeyError(f"{case_dir / 'nodes.csv'} is missing requested node column: {column}")
+
+    node_features = torch.tensor(np.stack(feature_arrays, axis=-1), dtype=torch.float32)
+
+    if all(column in nodes_df.columns for column in DEFAULT_NODE_TARGET_COLUMNS):
+        node_targets = torch.tensor(
+            nodes_df[list(DEFAULT_NODE_TARGET_COLUMNS)].to_numpy(dtype=np.float32),
+            dtype=torch.float32,
+        )
+    elif target_path is not None:
+        node_targets = _load_per_frequency_targets(target_path, nodes_df)
+    elif (case_dir / FINAL_RMISES_FILENAME).exists():
+        node_targets = _load_final_rmises_targets(case_dir, nodes_df)
+    else:
+        raise KeyError(
+            f"{case_dir} must provide either {list(DEFAULT_NODE_TARGET_COLUMNS)} in nodes.csv, "
+            f"{FINAL_RMISES_FILENAME}, or a per-frequency target file"
+        )
     return node_features, node_targets
 
 
@@ -145,9 +289,17 @@ def _cache_signature(
     return f"nodes-{node_part}__edges-{edge_part}__freq-{freq_part}__undir-{undir_part}"
 
 
+def _cache_sample_name(sample_path: Path) -> str:
+    if sample_path.is_dir():
+        return sample_path.name
+    if sample_path.parent.name == PER_FREQUENCY_DIRNAME:
+        return f"{sample_path.parent.parent.name}__{sample_path.stem}"
+    return sample_path.stem
+
+
 def _cache_path_for_case(
     cache_dir: str | Path,
-    case_dir: Path,
+    sample_path: Path,
     node_columns: Sequence[str],
     edge_columns: Sequence[str],
     target_freq_key: str,
@@ -159,7 +311,7 @@ def _cache_path_for_case(
         target_freq_key=target_freq_key,
         make_undirected=make_undirected,
     )
-    return Path(cache_dir) / signature / f"{case_dir.name}.pt"
+    return Path(cache_dir) / signature / f"{_cache_sample_name(sample_path)}.pt"
 
 
 def _save_case_cache(cache_path: Path, case: CaseGraph) -> None:
@@ -173,6 +325,7 @@ def _save_case_cache(cache_path: Path, case: CaseGraph) -> None:
             "params": case.params,
             "psd": case.psd,
             "freq_target": case.freq_target,
+            "frequency_scalar": case.frequency_scalar,
             "node_targets": case.node_targets,
         },
         cache_path,
@@ -189,6 +342,7 @@ def _load_case_cache(cache_path: Path) -> CaseGraph:
         params=payload["params"],
         psd=payload["psd"],
         freq_target=payload["freq_target"],
+        frequency_scalar=payload.get("frequency_scalar", torch.empty(0, dtype=torch.float32)),
         node_targets=payload["node_targets"],
     )
 
@@ -330,12 +484,13 @@ def load_case_graph(
     make_undirected: bool = True,
     cache_dir: str | Path | None = None,
 ) -> CaseGraph:
-    case_path = Path(case_dir)
+    sample_path = Path(case_dir)
+    case_path, target_path = _resolve_case_and_target_path(sample_path)
 
     if cache_dir is not None:
         cache_path = _cache_path_for_case(
             cache_dir=cache_dir,
-            case_dir=case_path,
+            sample_path=sample_path,
             node_columns=node_columns,
             edge_columns=edge_columns,
             target_freq_key=target_freq_key,
@@ -344,22 +499,31 @@ def load_case_graph(
         if cache_path.exists():
             return _load_case_cache(cache_path)
 
-    params, psd, freq_target = _load_global_json(case_path, target_freq_key=target_freq_key)
-    node_features, node_targets = _load_nodes(case_path, node_columns=node_columns)
+    global_payload = _load_global_payload(case_path)
+    params, psd, freq_target = _load_global_json(global_payload, case_path, target_freq_key=target_freq_key)
+    node_features, node_targets = _load_nodes(
+        case_path,
+        node_columns=node_columns,
+        global_payload=global_payload,
+        target_path=target_path,
+    )
     edge_index, edge_features = _load_edges(
         case_path,
         edge_columns=edge_columns,
         make_undirected=make_undirected,
     )
+    frequency_scalar = _load_frequency_scalar(target_path)
+    sample_name = case_path.name if target_path is None else f"{case_path.name}/{target_path.name}"
 
     case = CaseGraph(
-        name=case_path.name,
+        name=sample_name,
         node_features=node_features,
         edge_index=edge_index,
         edge_features=edge_features,
         params=params,
         psd=psd,
         freq_target=freq_target,
+        frequency_scalar=frequency_scalar,
         node_targets=node_targets,
     )
 
@@ -398,12 +562,51 @@ def load_selected_cases(
     return loaded
 
 
-def build_global_features(case: CaseGraph, use_psd: bool, use_freq_top3: bool = False) -> torch.Tensor:
+def expand_case_sample_paths(case_paths: Sequence[Path], dataset_cfg: dict[str, Any]) -> list[Path]:
+    sample_mode = str(dataset_cfg.get("sample_mode", "case")).lower()
+    if sample_mode == "case":
+        return list(case_paths)
+    if sample_mode != "per_frequency":
+        raise ValueError(f"Unsupported dataset.sample_mode: {sample_mode}")
+
+    include_zero_frequency = bool(dataset_cfg.get("include_zero_frequency", False))
+    min_frequency = dataset_cfg.get("min_frequency_hz")
+    max_frequency = dataset_cfg.get("max_frequency_hz")
+    expanded: list[Path] = []
+    for case_path in case_paths:
+        frame_dir = Path(case_path) / PER_FREQUENCY_DIRNAME
+        if not frame_dir.exists():
+            raise FileNotFoundError(f"Per-frequency target directory does not exist: {frame_dir}")
+
+        frame_paths: list[tuple[float, Path]] = []
+        for frame_path in sorted(frame_dir.glob("*.csv")):
+            frequency_scalar = float(_load_frequency_scalar(frame_path).item())
+            if not include_zero_frequency and abs(frequency_scalar) < 1e-9:
+                continue
+            if min_frequency is not None and frequency_scalar < float(min_frequency):
+                continue
+            if max_frequency is not None and frequency_scalar > float(max_frequency):
+                continue
+            frame_paths.append((frequency_scalar, frame_path))
+        expanded.extend(path for _, path in sorted(frame_paths, key=lambda item: item[0]))
+    return expanded
+
+
+def build_global_features(
+    case: CaseGraph,
+    use_psd: bool,
+    use_freq_top3: bool = False,
+    use_frequency_scalar: bool = False,
+) -> torch.Tensor:
     features = [case.params]
     if use_psd:
         features.append(case.psd)
     if use_freq_top3:
         features.append(case.freq_target)
+    if use_frequency_scalar:
+        if case.frequency_scalar.numel() == 0:
+            raise ValueError("Requested use_frequency_scalar=True but this sample does not provide a frequency value.")
+        features.append(case.frequency_scalar)
     if len(features) == 1:
         return case.params.clone()
     return torch.cat(features, dim=0)

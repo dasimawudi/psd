@@ -12,7 +12,13 @@ import random
 import torch
 import torch.nn.functional as F
 
-from case7_gnn.data import build_global_features, discover_case_index, load_case_graph, resolve_case_splits
+from case7_gnn.data import (
+    build_global_features,
+    discover_case_index,
+    expand_case_sample_paths,
+    load_case_graph,
+    resolve_case_splits,
+)
 from case7_gnn.models import FieldGNN, FrequencyGNN
 from case7_gnn.runtime import ensure_dir, make_logger, write_json, write_yaml
 from case7_gnn.scalers import (
@@ -85,6 +91,69 @@ def _extract_edge_distance(case: Any, edge_columns: list[str] | tuple[str, ...] 
     return case.edge_features[:, dist_index].abs()
 
 
+def _infer_earpiece_centers(
+    case: Any,
+    node_columns: list[str] | tuple[str, ...] | Any,
+    feature_cfg: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    cfg = feature_cfg or {}
+    x_index = _column_index(node_columns, "x")
+    y_index = _column_index(node_columns, "y")
+    z_index = _column_index(node_columns, "z")
+    bc_index = _column_index(node_columns, "bc_mask")
+    if x_index is None or y_index is None or z_index is None:
+        raise ValueError("earpiece center inference requires x, y, z in dataset.node_columns")
+
+    if bc_index is None:
+        center = case.node_features.new_tensor(
+            [[float(case.params[1]), 0.0, float(case.params[3])]],
+        )
+        return center
+
+    bc_mask = case.node_features[:, bc_index] >= 0.5
+    bc_points = case.node_features[bc_mask][:, [x_index, y_index, z_index]]
+    if bc_points.size(0) == 0:
+        center = case.node_features.new_tensor(
+            [[float(case.params[1]), 0.0, float(case.params[3])]],
+        )
+        return center
+
+    theta = torch.atan2(bc_points[:, 1], bc_points[:, 0])
+    theta = torch.remainder(theta, 2.0 * math.pi)
+    theta_sorted, order = torch.sort(theta)
+    points_sorted = bc_points[order]
+
+    wrapped_theta = torch.cat([theta_sorted, theta_sorted[:1] + 2.0 * math.pi], dim=0)
+    theta_gap_threshold = float(cfg.get("earpiece_center_gap_threshold_deg", 25.0)) * math.pi / 180.0
+    gap_mask = (wrapped_theta[1:] - wrapped_theta[:-1]) > theta_gap_threshold
+
+    split_indices = torch.nonzero(gap_mask, as_tuple=False).flatten().tolist()
+    if not split_indices:
+        return points_sorted.mean(dim=0, keepdim=True)
+
+    centers: list[torch.Tensor] = []
+    start = 0
+    for split_index in split_indices:
+        end = split_index + 1
+        if end > start:
+            centers.append(points_sorted[start:end].mean(dim=0))
+        start = end
+    if start < points_sorted.size(0):
+        centers.append(points_sorted[start:].mean(dim=0))
+
+    # Merge first/last clusters if the wrap-around gap was not a true separator.
+    if len(centers) > 1 and not bool(gap_mask[-1].item()):
+        merged = torch.cat([points_sorted[start:], points_sorted[: split_indices[0] + 1]], dim=0).mean(dim=0)
+        middle_points = []
+        prev = split_indices[0] + 1
+        for split_index in split_indices[1:]:
+            middle_points.append(points_sorted[prev : split_index + 1].mean(dim=0))
+            prev = split_index + 1
+        centers = [merged] + middle_points
+
+    return torch.stack(centers, dim=0)
+
+
 def build_augmented_node_features(
     case: Any,
     node_columns: list[str] | tuple[str, ...] | Any,
@@ -119,24 +188,19 @@ def build_augmented_node_features(
     r_norm = r / plate_radius
     dist_to_edge = (plate_radius - r) / plate_radius
 
-    # Approximate the earpiece attachment center along the +x radial direction.
-    earpiece_center_x = x.new_full((x.size(0), 1), float(earpiece_radial_dist))
-    earpiece_center_y = y.new_zeros((y.size(0), 1))
-    earpiece_center_z = z.new_full((z.size(0), 1), float(earpiece_hole_top_dist))
-    dist_to_earpiece = torch.sqrt(
-        (x - earpiece_center_x).pow(2)
-        + (y - earpiece_center_y).pow(2)
-        + (z - earpiece_center_z).pow(2)
-        + 1e-12
-    ) / plate_radius
-    radial_offset_to_earpiece = (r - earpiece_radial_dist) / plate_radius
+    earpiece_centers = _infer_earpiece_centers(case, node_columns=node_columns, feature_cfg=cfg)
+    node_xyz = torch.cat([x, y, z], dim=-1)
+    pairwise_center_distance = torch.cdist(node_xyz, earpiece_centers)
+    dist_to_earpiece = pairwise_center_distance.min(dim=1, keepdim=True).values / plate_radius
+    center_radius = torch.sqrt(earpiece_centers[:, 0].pow(2) + earpiece_centers[:, 1].pow(2) + 1e-12)
+    mean_earpiece_radius = center_radius.mean().clamp_min(1e-6)
+    radial_offset_to_earpiece = (r - mean_earpiece_radius) / plate_radius
 
     boundary_band_ratio = float(cfg.get("boundary_band_ratio", 0.08))
     earpiece_band_ratio = float(cfg.get("earpiece_band_ratio", 0.12))
     near_boundary = (dist_to_edge <= boundary_band_ratio).to(dtype=case.node_features.dtype)
-    near_earpiece = (dist_to_earpiece <= max(earpiece_band_ratio, float(earpiece_width / plate_radius))).to(
-        dtype=case.node_features.dtype
-    )
+    near_earpiece_threshold = max(earpiece_band_ratio, float(earpiece_width / plate_radius))
+    near_earpiece = (dist_to_earpiece <= near_earpiece_threshold).to(dtype=case.node_features.dtype)
 
     physics_features = [
         x_norm,
@@ -196,6 +260,7 @@ def prepare_case(
     task: str,
     use_psd: bool,
     use_freq_top3: bool,
+    use_frequency_scalar: bool,
     clamp_negative_rmises: bool,
     node_columns: list[str] | tuple[str, ...] | Any,
     edge_columns: list[str] | tuple[str, ...] | Any,
@@ -204,7 +269,12 @@ def prepare_case(
 ) -> PreparedCase:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False, "threshold": 0.0}
     global_features = global_scaler.transform(
-        build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3)
+        build_global_features(
+            case,
+            use_psd=use_psd,
+            use_freq_top3=use_freq_top3,
+            use_frequency_scalar=use_frequency_scalar,
+        )
     )
     node_features = node_scaler.transform(
         build_augmented_node_features(case, node_columns=node_columns, feature_cfg=feature_cfg)
@@ -247,6 +317,7 @@ def fit_feature_scalers(
     task: str,
     use_psd: bool,
     use_freq_top3: bool,
+    use_frequency_scalar: bool,
     clamp_negative_rmises: bool,
     feature_cfg: dict[str, Any] | None = None,
     case_limit: int | None = None,
@@ -287,7 +358,14 @@ def fit_feature_scalers(
             )
         )
         edge_stats.update(case.edge_features)
-        global_stats.update(build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3))
+        global_stats.update(
+            build_global_features(
+                case,
+                use_psd=use_psd,
+                use_freq_top3=use_freq_top3,
+                use_frequency_scalar=use_frequency_scalar,
+            )
+        )
 
         if task == "frequency":
             target_stats.update(case.freq_target)
@@ -744,6 +822,7 @@ class Case7Trainer:
         self.feature_cfg = dict(config.get("features", {}))
         self.use_psd = bool(self.feature_cfg["use_psd"])
         self.use_freq_top3 = bool(self.feature_cfg.get("use_freq_top3", False))
+        self.use_frequency_scalar = bool(self.feature_cfg.get("use_frequency_scalar", False))
         self.clamp_negative_rmises = bool(self.dataset_cfg.get("clamp_negative_rmises", True))
         self.cache_dir = self.dataset_cfg.get("cache_dir")
 
@@ -781,6 +860,7 @@ class Case7Trainer:
             task=self.task,
             use_psd=self.use_psd,
             use_freq_top3=self.use_freq_top3,
+            use_frequency_scalar=self.use_frequency_scalar,
             clamp_negative_rmises=self.clamp_negative_rmises,
             node_columns=self.dataset_cfg["node_columns"],
             edge_columns=self.dataset_cfg["edge_columns"],
@@ -792,9 +872,13 @@ class Case7Trainer:
         self.case_index = discover_case_index(self.dataset_cfg["root"])
         self.split_names = resolve_case_splits(self.dataset_cfg["root"], self.dataset_cfg)
 
-        self.train_case_paths = [self.case_index[name] for name in self.split_names["train"]]
-        self.val_case_paths = [self.case_index[name] for name in self.split_names["val"]]
-        self.test_case_paths = [self.case_index[name] for name in self.split_names.get("test", [])]
+        train_case_dirs = [self.case_index[name] for name in self.split_names["train"]]
+        val_case_dirs = [self.case_index[name] for name in self.split_names["val"]]
+        test_case_dirs = [self.case_index[name] for name in self.split_names.get("test", [])]
+
+        self.train_case_paths = expand_case_sample_paths(train_case_dirs, self.dataset_cfg)
+        self.val_case_paths = expand_case_sample_paths(val_case_dirs, self.dataset_cfg)
+        self.test_case_paths = expand_case_sample_paths(test_case_dirs, self.dataset_cfg)
 
         node_scaler, edge_scaler, global_scaler, target_scaler = fit_feature_scalers(
             train_case_paths=self.train_case_paths,
@@ -802,6 +886,7 @@ class Case7Trainer:
             task=self.task,
             use_psd=self.use_psd,
             use_freq_top3=self.use_freq_top3,
+            use_frequency_scalar=self.use_frequency_scalar,
             clamp_negative_rmises=self.clamp_negative_rmises,
             feature_cfg=self.feature_cfg,
             case_limit=self.dataset_cfg.get("scaler_fit_case_limit"),
@@ -882,6 +967,7 @@ class Case7Trainer:
         )
         self.logger.info("Using PSD features: %s", self.use_psd)
         self.logger.info("Using freq_top3 features: %s", self.use_freq_top3)
+        self.logger.info("Using scalar frequency feature: %s", self.use_frequency_scalar)
         self.logger.info(
             "Physics node feature augmentation: %s",
             bool(self.feature_cfg.get("augment_node_physics", False)),

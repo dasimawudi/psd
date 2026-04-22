@@ -16,7 +16,13 @@ from case7_gnn.scalers import (
     encode_field_targets,
     metric_field_targets,
 )
-from case7_gnn.trainer import PreparedCase, build_model, decode_field_prediction, get_two_stage_rmises_cfg
+from case7_gnn.trainer import (
+    PreparedCase,
+    build_model,
+    decode_field_prediction,
+    get_two_stage_rmises_cfg,
+    prepare_case,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +51,8 @@ def _prepare_case(
     two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
     use_psd = bool(config["features"]["use_psd"])
     use_freq_top3 = bool(config["features"].get("use_freq_top3", False))
+    use_frequency_scalar = bool(config["features"].get("use_frequency_scalar", False))
+    feature_cfg = dict(config.get("features", {}))
     clamp_negative_rmises = bool(dataset_cfg.get("clamp_negative_rmises", True))
 
     case = load_case_graph(
@@ -55,35 +63,21 @@ def _prepare_case(
         make_undirected=bool(dataset_cfg["make_undirected"]),
         cache_dir=dataset_cfg.get("cache_dir"),
     )
-
-    global_features = scalers["global"].transform(
-        build_global_features(case, use_psd=use_psd, use_freq_top3=use_freq_top3)
-    )
-    node_features = scalers["node"].transform(case.node_features)
-    edge_features = scalers["edge"].transform(case.edge_features)
-
-    if config["task"] == "frequency":
-        target_normalized = scalers["target"].transform(case.freq_target)
-        target_metric = case.freq_target
-    else:
-        target_metric = metric_field_targets(case.node_targets, clamp_negative_rmises=clamp_negative_rmises)
-        target_normalized = scalers["target"].transform(
-            encode_field_targets(
-                case.node_targets,
-                clamp_negative_rmises=clamp_negative_rmises,
-                rmises_as_excess=bool(two_stage_rmises_cfg["enabled"]),
-                rmises_threshold=float(two_stage_rmises_cfg["threshold"]),
-            )
-        )
-
-    prepared = PreparedCase(
-        name=case.name,
-        node_features=node_features,
-        edge_index=case.edge_index,
-        edge_features=edge_features,
-        global_features=global_features,
-        target_normalized=target_normalized,
-        target_metric=target_metric,
+    prepared = prepare_case(
+        case=case,
+        node_scaler=scalers["node"],
+        edge_scaler=scalers["edge"],
+        global_scaler=scalers["global"],
+        target_scaler=scalers["target"],
+        task=config["task"],
+        use_psd=use_psd,
+        use_freq_top3=use_freq_top3,
+        use_frequency_scalar=use_frequency_scalar,
+        clamp_negative_rmises=clamp_negative_rmises,
+        node_columns=dataset_cfg["node_columns"],
+        edge_columns=dataset_cfg["edge_columns"],
+        feature_cfg=feature_cfg,
+        two_stage_rmises_cfg=two_stage_rmises_cfg,
     )
     return case, prepared
 

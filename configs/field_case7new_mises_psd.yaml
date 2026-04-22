@@ -1,0 +1,65 @@
+task: field
+
+dataset:
+  root: case7new
+  sample_mode: per_frequency
+  include_zero_frequency: false
+  min_frequency_hz: 20.0
+  max_frequency_hz: 2000.0
+  split_mode: ratio
+  split_seed: 42
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  cache_dir: .cache/case7new_per_frequency_graphs
+  scaler_fit_case_limit: 256
+  node_columns: [x, y, z, bc_mask]
+  edge_columns: [dx, dy, dz, dist]
+  target_freq_key: freq_top3
+  make_undirected: true
+  clamp_negative_rmises: true
+
+features:
+  use_psd: true
+  use_freq_top3: false
+  use_frequency_scalar: true
+  augment_node_physics: true
+  boundary_band_ratio: 0.08
+  earpiece_band_ratio: 0.12
+
+model:
+  hidden_dim: 64
+  global_dim: 32
+  num_layers: 3
+  rmises_refine_layers: 2
+  dropout: 0.10
+  conditioning:
+    enabled: true
+    case_dim: 48
+
+training:
+  seed: 42
+  device: auto
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  loss: smooth_l1
+  eval_every: 1
+  print_every: 1
+  early_stopping_patience: 6
+  save_dir: outputs/field_case7new_mises_psd
+
+field_loss:
+  rta_loss_weight: 0.0
+  rmises_loss_weight: 2.0
+  rmises_hotspot_alpha: 4.0
+  rmises_hotspot_gamma: 2.0
+  physics_rta_smoothness_weight: 0.0
+  physics_rmises_smoothness_weight: 0.01
+  physics_distance_power: 1.0
+  physics_exclude_boundary_edges: true
+  physics_hotspot_exempt_quantile: 0.98
+
+rmises_two_stage:
+  enabled: false
