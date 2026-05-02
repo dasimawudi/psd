@@ -63,6 +63,7 @@ def get_two_stage_rmises_cfg(config: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(raw_cfg.get("enabled", False)),
         "threshold": float(raw_cfg.get("threshold", 25.0)),
         "threshold_quantile": raw_cfg.get("threshold_quantile"),
+        "threshold_peak_ratio": raw_cfg.get("threshold_peak_ratio"),
         "prob_threshold": float(raw_cfg.get("prob_threshold", 0.5)),
         "classification_weight": float(raw_cfg.get("classification_weight", 1.0)),
         "regression_weight": float(raw_cfg.get("regression_weight", 2.0)),
@@ -457,6 +458,11 @@ def build_stress_hotspot_targets(stress_values: torch.Tensor, cfg: dict[str, Any
         q = float(threshold_quantile)
         if 0.0 < q < 1.0 and stress_values.numel() > 0:
             threshold = max(threshold, float(torch.quantile(stress_values, q).item()))
+    threshold_peak_ratio = cfg.get("threshold_peak_ratio")
+    if threshold_peak_ratio is not None:
+        ratio = float(threshold_peak_ratio)
+        if ratio > 0.0 and stress_values.numel() > 0:
+            threshold = max(threshold, float(stress_values.max().item()) * ratio)
     return build_rmises_hotspot_targets(stress_values, threshold=threshold)
 
 

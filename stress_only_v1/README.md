@@ -52,6 +52,10 @@ The loss is hotspot-focused:
 - peak stress consistency
 - optional smoothness only outside hotspots
 
+With `stress_two_stage.threshold_peak_ratio`, true hotspots can be defined by
+each graph's own peak stress, for example `0.05` means nodes with
+`stress >= 5% * peak_stress` are treated as hotspot nodes.
+
 Evaluation also reports the presentation metric:
 
 ```text
