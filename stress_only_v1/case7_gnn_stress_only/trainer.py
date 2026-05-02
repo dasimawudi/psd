@@ -31,6 +31,15 @@ from case7_gnn_stress_only.scalers import (
 )
 
 
+CANONICAL_STRESS_HOTSPOT_METRIC_CFG: dict[str, Any] = {
+    "threshold": 0.0,
+    "threshold_quantile": 0.999,
+    "threshold_peak_ratio": 0.05,
+    "threshold_combine": "min",
+    "within_relative_error": 0.25,
+}
+
+
 @dataclass
 class PreparedCase:
     name: str
@@ -72,6 +81,23 @@ def get_two_stage_rmises_cfg(config: dict[str, Any]) -> dict[str, Any]:
         "positive_class_weight": float(raw_cfg.get("positive_class_weight", 10.0)),
         "within_relative_error": float(raw_cfg.get("within_relative_error", 0.25)),
     }
+
+
+def get_stress_hotspot_metric_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(CANONICAL_STRESS_HOTSPOT_METRIC_CFG)
+    raw_cfg = dict(config.get("stress_hotspot_metric", {}))
+    for key in cfg:
+        if key in raw_cfg:
+            cfg[key] = raw_cfg[key]
+
+    cfg["threshold"] = float(cfg["threshold"])
+    if cfg["threshold_quantile"] is not None:
+        cfg["threshold_quantile"] = float(cfg["threshold_quantile"])
+    if cfg["threshold_peak_ratio"] is not None:
+        cfg["threshold_peak_ratio"] = float(cfg["threshold_peak_ratio"])
+    cfg["threshold_combine"] = str(cfg["threshold_combine"]).lower()
+    cfg["within_relative_error"] = float(cfg["within_relative_error"])
+    return cfg
 
 
 def _column_index(column_names: list[str] | tuple[str, ...] | Any, target_name: str) -> int | None:
@@ -726,8 +752,10 @@ def evaluate_field(
     loss_name: str,
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
+    hotspot_metric_cfg: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
+    metric_hotspot_cfg = hotspot_metric_cfg or CANONICAL_STRESS_HOTSPOT_METRIC_CFG
     scaler = target_scaler.to(device)
     total_loss = 0.0
     total_nodes = 0
@@ -798,21 +826,22 @@ def evaluate_field(
                 total_top5_abs += stress_error[top5_mask].sum().item()
                 total_top5_nodes += int(top5_mask.sum().item())
 
+            target_hotspot = build_stress_hotspot_targets(stress_target, metric_hotspot_cfg).to(dtype=torch.bool)
+            if target_hotspot.any():
+                total_hotspot_abs += stress_error[target_hotspot].sum().item()
+                hotspot_count = int(target_hotspot.sum().item())
+                total_hotspot_nodes += hotspot_count
+                hotspot_relative_error = stress_error[target_hotspot] / stress_target[target_hotspot].abs().clamp_min(1e-12)
+                total_hotspot_within_tolerance += int(
+                    (hotspot_relative_error <= float(metric_hotspot_cfg["within_relative_error"])).sum().item()
+                )
+
             if bool(two_stage_cfg["enabled"]):
                 assert hotspot_prob is not None and hotspot_mask is not None
-                target_hotspot = build_stress_hotspot_targets(stress_target, two_stage_cfg).to(dtype=torch.bool)
                 pred_hotspot = hotspot_mask.detach().cpu().to(dtype=torch.bool)
                 total_hotspot_tp += float((pred_hotspot & target_hotspot).sum().item())
                 total_hotspot_fp += float((pred_hotspot & ~target_hotspot).sum().item())
                 total_hotspot_fn += float((~pred_hotspot & target_hotspot).sum().item())
-                if target_hotspot.any():
-                    total_hotspot_abs += stress_error[target_hotspot].sum().item()
-                    hotspot_count = int(target_hotspot.sum().item())
-                    total_hotspot_nodes += hotspot_count
-                    hotspot_relative_error = stress_error[target_hotspot] / stress_target[target_hotspot].abs().clamp_min(1e-12)
-                    total_hotspot_within_tolerance += int(
-                        (hotspot_relative_error <= float(two_stage_cfg["within_relative_error"])).sum().item()
-                    )
 
     denom = max(total_nodes, 1)
     metrics = {
@@ -822,14 +851,14 @@ def evaluate_field(
         "stress_top5_mae": total_top5_abs / max(total_top5_nodes, 1),
         "stress_peak_relative_error": total_peak_relative_error / max(total_cases, 1),
     }
+    hotspot_within_tolerance_ratio = total_hotspot_within_tolerance / max(total_hotspot_nodes, 1)
+    metrics["stress_hotspot_mae"] = total_hotspot_abs / max(total_hotspot_nodes, 1)
+    metrics["stress_hotspot_within25_ratio"] = hotspot_within_tolerance_ratio
+    metrics["stress_hotspot_miss25_rate"] = 1.0 - hotspot_within_tolerance_ratio
     if bool(two_stage_cfg["enabled"]):
         precision = total_hotspot_tp / max(total_hotspot_tp + total_hotspot_fp, 1.0)
         recall = total_hotspot_tp / max(total_hotspot_tp + total_hotspot_fn, 1.0)
         f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
-        hotspot_within_tolerance_ratio = total_hotspot_within_tolerance / max(total_hotspot_nodes, 1)
-        metrics["stress_hotspot_mae"] = total_hotspot_abs / max(total_hotspot_nodes, 1)
-        metrics["stress_hotspot_within25_ratio"] = hotspot_within_tolerance_ratio
-        metrics["stress_hotspot_miss25_rate"] = 1.0 - hotspot_within_tolerance_ratio
         metrics["hotspot_precision"] = precision
         metrics["hotspot_recall"] = recall
         metrics["hotspot_f1"] = f1
@@ -911,6 +940,7 @@ class Case7Trainer:
         self.training_cfg = config["training"]
         self.field_loss_cfg = dict(config.get("field_loss", {}))
         self.two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
+        self.hotspot_metric_cfg = get_stress_hotspot_metric_cfg(config)
         self.feature_cfg = dict(config.get("features", {}))
         self.use_psd = bool(self.feature_cfg["use_psd"])
         self.use_freq_top3 = bool(self.feature_cfg.get("use_freq_top3", False))
@@ -1009,6 +1039,7 @@ class Case7Trainer:
         resolved_dataset["test_cases"] = list(self.split_names.get("test", []))
         self.resolved_config = dict(self.config)
         self.resolved_config["dataset"] = resolved_dataset
+        self.resolved_config["stress_hotspot_metric"] = dict(self.hotspot_metric_cfg)
         write_yaml(self.save_dir / "resolved_config.yaml", self.resolved_config)
 
     def _evaluate(self, case_paths: list[Path], loss_name: str) -> dict[str, float]:
@@ -1033,6 +1064,7 @@ class Case7Trainer:
             loss_name=loss_name,
             field_loss_cfg=self.field_loss_cfg,
             two_stage_rmises_cfg=self.two_stage_rmises_cfg,
+            hotspot_metric_cfg=self.hotspot_metric_cfg,
         )
 
     def _append_history_row(self, row: dict[str, Any]) -> None:
@@ -1079,6 +1111,8 @@ class Case7Trainer:
                 self.logger.info("Two-stage stress config: %s", json.dumps(self.two_stage_rmises_cfg, ensure_ascii=False))
         if self.task == "field" and self.field_loss_cfg:
             self.logger.info("Field loss config: %s", json.dumps(self.field_loss_cfg, ensure_ascii=False))
+        if self.task == "field":
+            self.logger.info("Stress hotspot metric config: %s", json.dumps(self.hotspot_metric_cfg, ensure_ascii=False))
         self.logger.info("Split mode: %s", self.dataset_cfg.get("split_mode", "explicit"))
         if self.cache_dir:
             self.logger.info("Raw case cache: %s", self.cache_dir)

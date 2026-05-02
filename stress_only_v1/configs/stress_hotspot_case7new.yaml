@@ -83,3 +83,10 @@ stress_two_stage:
   background_regression_weight: 0.02
   positive_class_weight: 150.0
   within_relative_error: 0.25
+
+stress_hotspot_metric:
+  threshold: 0.0
+  threshold_quantile: 0.999
+  threshold_peak_ratio: 0.05
+  threshold_combine: min
+  within_relative_error: 0.25

@@ -52,11 +52,15 @@ The loss is hotspot-focused:
 - peak stress consistency
 - optional smoothness only outside hotspots
 
-With `stress_two_stage.threshold_peak_ratio`, true hotspots can be defined by
-each graph's own peak stress, for example `0.05` means nodes with
+With `stress_two_stage.threshold_peak_ratio`, training hotspots can be defined
+by each graph's own peak stress, for example `0.05` means nodes with
 `stress >= 5% * peak_stress` are treated as hotspot nodes. When both
 `threshold_quantile` and `threshold_peak_ratio` are set, `threshold_combine`
 chooses whether the stricter (`max`) or more inclusive (`min`) threshold is used.
+
+The reported `stress_hotspot_within25_ratio` uses the fixed
+`stress_hotspot_metric` definition, independent of training-label experiments:
+`stress >= min(q0.999, 0.05 * peak_stress)`.
 
 Evaluation also reports the presentation metric:
 
