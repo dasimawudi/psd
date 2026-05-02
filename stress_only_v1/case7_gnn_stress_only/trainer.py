@@ -64,6 +64,7 @@ def get_two_stage_rmises_cfg(config: dict[str, Any]) -> dict[str, Any]:
         "threshold": float(raw_cfg.get("threshold", 25.0)),
         "threshold_quantile": raw_cfg.get("threshold_quantile"),
         "threshold_peak_ratio": raw_cfg.get("threshold_peak_ratio"),
+        "threshold_combine": str(raw_cfg.get("threshold_combine", "max")).lower(),
         "prob_threshold": float(raw_cfg.get("prob_threshold", 0.5)),
         "classification_weight": float(raw_cfg.get("classification_weight", 1.0)),
         "regression_weight": float(raw_cfg.get("regression_weight", 2.0)),
@@ -452,17 +453,28 @@ def compute_pointwise_loss(prediction: torch.Tensor, target: torch.Tensor, loss_
 
 
 def build_stress_hotspot_targets(stress_values: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
-    threshold = float(cfg.get("threshold", 0.0))
+    threshold_floor = float(cfg.get("threshold", 0.0))
+    dynamic_thresholds: list[float] = []
     threshold_quantile = cfg.get("threshold_quantile")
     if threshold_quantile is not None:
         q = float(threshold_quantile)
         if 0.0 < q < 1.0 and stress_values.numel() > 0:
-            threshold = max(threshold, float(torch.quantile(stress_values, q).item()))
+            dynamic_thresholds.append(float(torch.quantile(stress_values, q).item()))
     threshold_peak_ratio = cfg.get("threshold_peak_ratio")
     if threshold_peak_ratio is not None:
         ratio = float(threshold_peak_ratio)
         if ratio > 0.0 and stress_values.numel() > 0:
-            threshold = max(threshold, float(stress_values.max().item()) * ratio)
+            dynamic_thresholds.append(float(stress_values.max().item()) * ratio)
+
+    threshold = threshold_floor
+    if dynamic_thresholds:
+        threshold_combine = str(cfg.get("threshold_combine", "max")).lower()
+        if threshold_combine == "max":
+            threshold = max(threshold_floor, max(dynamic_thresholds))
+        elif threshold_combine == "min":
+            threshold = max(threshold_floor, min(dynamic_thresholds))
+        else:
+            raise ValueError(f"Unsupported stress hotspot threshold_combine: {threshold_combine}")
     return build_rmises_hotspot_targets(stress_values, threshold=threshold)
 
 

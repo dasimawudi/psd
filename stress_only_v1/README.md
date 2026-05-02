@@ -54,7 +54,9 @@ The loss is hotspot-focused:
 
 With `stress_two_stage.threshold_peak_ratio`, true hotspots can be defined by
 each graph's own peak stress, for example `0.05` means nodes with
-`stress >= 5% * peak_stress` are treated as hotspot nodes.
+`stress >= 5% * peak_stress` are treated as hotspot nodes. When both
+`threshold_quantile` and `threshold_peak_ratio` are set, `threshold_combine`
+chooses whether the stricter (`max`) or more inclusive (`min`) threshold is used.
 
 Evaluation also reports the presentation metric:
 

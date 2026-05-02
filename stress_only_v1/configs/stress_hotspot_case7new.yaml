@@ -48,7 +48,7 @@ training:
   print_every: 1
   early_stopping_patience: 6
   selection_metric: stress_hotspot_miss25_rate
-  save_dir: stress_only_v1/outputs/stress_hotspot_case7new_peak005
+  save_dir: stress_only_v1/outputs/stress_hotspot_case7new_q999_peak005_min
 
 field_loss:
   stress_loss_weight: 1.0
@@ -74,11 +74,12 @@ field_loss:
 stress_two_stage:
   enabled: true
   threshold: 0.0
-  threshold_quantile:
+  threshold_quantile: 0.999
   threshold_peak_ratio: 0.05
+  threshold_combine: min
   prob_threshold: 0.5
   classification_weight: 1.0
   regression_weight: 2.0
   background_regression_weight: 0.02
-  positive_class_weight: 300.0
+  positive_class_weight: 150.0
   within_relative_error: 0.25
