@@ -48,7 +48,7 @@ training:
   print_every: 1
   early_stopping_patience: 6
   selection_metric: stress_hotspot_miss25_rate
-  save_dir: stress_only_v1/outputs/stress_hotspot_case7new_q999_peak005_min_regstrong
+  save_dir: stress_only_v1/outputs/stress_hotspot_case7new_q999_peak005_min_pos80
 
 field_loss:
   stress_loss_weight: 1.0
@@ -56,11 +56,11 @@ field_loss:
   stress_low_value_weight: 0.05
   stress_hotspot_alpha: 8.0
   stress_hotspot_gamma: 1.5
-  stress_hotspot_quantile: 0.995
-  stress_hotspot_boost: 10.0
+  stress_hotspot_quantile: 0.98
+  stress_hotspot_boost: 6.0
   stress_topk_ratio: 0.01
-  stress_topk_weight: 5.0
-  stress_peak_weight: 1.0
+  stress_topk_weight: 3.0
+  stress_peak_weight: 0.5
   stress_case_activity_quantile: 0.99
   stress_case_activity_reference: 10000.0
   stress_case_activity_power: 0.5
@@ -78,9 +78,9 @@ stress_two_stage:
   threshold_peak_ratio: 0.05
   threshold_combine: min
   prob_threshold: 0.5
-  classification_weight: 0.5
-  regression_weight: 4.0
-  background_regression_weight: 0.01
+  classification_weight: 1.0
+  regression_weight: 2.0
+  background_regression_weight: 0.02
   positive_class_weight: 80.0
   within_relative_error: 0.25
 
