@@ -104,6 +104,7 @@ def get_stress_peak_relative_cfg(config: dict[str, Any]) -> dict[str, Any]:
     raw_cfg = dict(config.get("stress_peak_relative", {}))
     return {
         "enabled": bool(raw_cfg.get("enabled", False)),
+        "combine_prediction": bool(raw_cfg.get("combine_prediction", True)),
         "peak_loss_weight": float(raw_cfg.get("peak_loss_weight", 1.0)),
         "relative_loss_weight": float(raw_cfg.get("relative_loss_weight", 0.5)),
     }
@@ -293,8 +294,11 @@ def compute_stress_prediction_normalized(
     peak_relative_cfg = stress_peak_relative_cfg or {"enabled": False}
     stress_start = _stress_output_start(two_stage_rmises_cfg)
     if bool(peak_relative_cfg["enabled"]):
-        relative_drop = F.softplus(prediction[:, stress_start])
+        direct_stress_prediction = prediction[:, stress_start]
         peak_prediction = prediction[:, stress_start + 1]
+        if not bool(peak_relative_cfg.get("combine_prediction", True)):
+            return direct_stress_prediction, peak_prediction, None
+        relative_drop = F.softplus(direct_stress_prediction)
         stress_prediction = peak_prediction - relative_drop
         return stress_prediction, peak_prediction, relative_drop
 
@@ -549,6 +553,7 @@ def compute_field_loss(
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
     peak_relative_cfg = stress_peak_relative_cfg or {
         "enabled": False,
+        "combine_prediction": True,
         "peak_loss_weight": 1.0,
         "relative_loss_weight": 0.0,
     }
@@ -1189,12 +1194,12 @@ class Case7Trainer:
             if self.two_stage_rmises_cfg["enabled"]:
                 self.logger.info("Two-stage stress config: %s", json.dumps(self.two_stage_rmises_cfg, ensure_ascii=False))
             self.logger.info(
-                "Peak-relative stress decomposition: %s",
+                "Peak stress auxiliary head: %s",
                 bool(self.stress_peak_relative_cfg["enabled"]),
             )
             if self.stress_peak_relative_cfg["enabled"]:
                 self.logger.info(
-                    "Peak-relative stress config: %s",
+                    "Peak stress auxiliary config: %s",
                     json.dumps(self.stress_peak_relative_cfg, ensure_ascii=False),
                 )
         if self.task == "field" and self.field_loss_cfg:

@@ -18,9 +18,9 @@ This folder is an isolated first-version branch for hotspot-focused stress predi
 
 - one output `[stress]` when `stress_two_stage.enabled: false`
 - two outputs `[hotspot_logit, stress]` when `stress_two_stage.enabled: true`
-- when `stress_peak_relative.enabled: true`, stress is decomposed into a graph-level peak scale and a node-level relative drop:
-  - `[stress_drop_from_peak, stress_peak]` without two-stage hotspot classification
-  - `[hotspot_logit, stress_drop_from_peak, stress_peak]` with two-stage hotspot classification
+- when `stress_peak_relative.enabled: true`, a graph-level peak scale head is added:
+  - `[stress_node_head, stress_peak]` without two-stage hotspot classification
+  - `[hotspot_logit, stress_node_head, stress_peak]` with two-stage hotspot classification
 
 The shared graph encoder is still conditioned by global geometry, PSD, modal frequencies, current frequency, and current-frequency-to-mode relations.
 
@@ -56,15 +56,17 @@ The loss is hotspot-focused:
 - optional peak-relative decomposition loss
 - optional smoothness only outside hotspots
 
-In peak-relative mode, the final standardized log-stress used for loss and
-metrics is:
+When `stress_peak_relative.combine_prediction: true`, the final standardized
+log-stress used for loss and metrics is:
 
 ```text
 pred_stress = pred_peak - softplus(pred_drop_from_peak)
 ```
 
-This gives the model a separate graph-level peak-amplitude target while still
-learning the node-wise stress map.
+When `combine_prediction: false`, the first stress output is used directly as
+the final node-wise stress prediction, and the graph-level peak output is only
+an auxiliary target. This weaker mode keeps the baseline direct stress path
+while still nudging the model to learn peak amplitude.
 
 With `stress_two_stage.threshold_peak_ratio`, training hotspots can be defined
 by each graph's own peak stress, for example `0.05` means nodes with
