@@ -1,0 +1,1143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTA / RMises 数据分布可视化</title>
+  <style>
+    :root {
+      --bg: #f4efe5;
+      --bg-accent: #f7f2eb;
+      --panel: rgba(255, 251, 245, 0.88);
+      --panel-strong: rgba(255, 248, 240, 0.97);
+      --border: rgba(122, 71, 22, 0.16);
+      --text: #2f2316;
+      --muted: #7a6855;
+      --primary: #bf5a36;
+      --primary-soft: rgba(191, 90, 54, 0.14);
+      --secondary: #1f6f78;
+      --secondary-soft: rgba(31, 111, 120, 0.14);
+      --good: #2f7d4d;
+      --warning: #b8741f;
+      --shadow: 0 20px 60px rgba(95, 63, 31, 0.12);
+      --radius: 26px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(245, 191, 124, 0.32), transparent 28%),
+        radial-gradient(circle at top right, rgba(72, 151, 156, 0.18), transparent 24%),
+        linear-gradient(180deg, #f8f4ec 0%, #efe4d3 100%);
+    }
+
+    .shell {
+      width: min(1240px, calc(100% - 32px));
+      margin: 32px auto 48px;
+    }
+
+    .hero {
+      padding: 28px 30px 32px;
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 8px);
+      background:
+        linear-gradient(135deg, rgba(255, 245, 229, 0.94), rgba(255, 251, 246, 0.85)),
+        linear-gradient(90deg, rgba(191, 90, 54, 0.08), rgba(31, 111, 120, 0.06));
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 300px;
+      height: 300px;
+      right: -90px;
+      top: -120px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(191, 90, 54, 0.20) 0%, rgba(191, 90, 54, 0) 72%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 247, 237, 0.9);
+      color: var(--primary);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 18px 0 12px;
+      font-size: clamp(32px, 5vw, 54px);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+      max-width: 720px;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.7;
+    }
+
+    .grid {
+      display: grid;
+      gap: 22px;
+      margin-top: 24px;
+    }
+
+    .control-grid {
+      grid-template-columns: 1.2fr 0.8fr;
+      align-items: start;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+
+    .card strong.section-title,
+    .card h2 {
+      display: block;
+      margin: 0 0 12px;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    .upload-card {
+      padding: 26px;
+    }
+
+    .dropzone {
+      border: 2px dashed rgba(191, 90, 54, 0.35);
+      border-radius: 22px;
+      padding: 30px 26px;
+      background:
+        linear-gradient(135deg, rgba(255, 248, 239, 0.9), rgba(255, 252, 247, 0.74));
+      transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+      cursor: pointer;
+    }
+
+    .dropzone.dragover {
+      transform: translateY(-2px);
+      border-color: var(--secondary);
+      box-shadow: inset 0 0 0 1px rgba(31, 111, 120, 0.14);
+    }
+
+    .dropzone h2 {
+      font-size: 28px;
+      margin-bottom: 10px;
+    }
+
+    .dropzone p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .dropzone .cta {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 20px;
+      padding: 12px 18px;
+      border-radius: 999px;
+      background: var(--primary);
+      color: #fffaf7;
+      font-weight: 700;
+      box-shadow: 0 14px 24px rgba(191, 90, 54, 0.24);
+    }
+
+    .upload-hints {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .tag {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 247, 238, 0.94);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .controls-card {
+      padding: 24px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .control-block {
+      display: grid;
+      gap: 10px;
+    }
+
+    label {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    select,
+    input[type="range"] {
+      width: 100%;
+    }
+
+    select {
+      padding: 12px 14px;
+      border: 1px solid rgba(122, 71, 22, 0.22);
+      border-radius: 14px;
+      background: var(--panel-strong);
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .range-row {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .range-value {
+      min-width: 58px;
+      text-align: center;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(31, 111, 120, 0.1);
+      color: var(--secondary);
+      font-weight: 700;
+    }
+
+    input[type="range"] {
+      accent-color: var(--secondary);
+    }
+
+    .summary-grid {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .summary-card {
+      padding: 20px 22px;
+      background: rgba(255, 251, 247, 0.92);
+    }
+
+    .summary-card .label {
+      color: var(--muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .summary-card .value {
+      margin-top: 10px;
+      font-size: clamp(24px, 3vw, 34px);
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    .summary-card .detail {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .metric-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .metric-card {
+      padding: 24px;
+      display: grid;
+      gap: 20px;
+    }
+
+    .metric-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+    }
+
+    .metric-title {
+      font-size: 22px;
+      font-weight: 800;
+      margin: 0;
+    }
+
+    .metric-subtitle {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .metric-badge {
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      background: var(--primary-soft);
+      color: var(--primary);
+      white-space: nowrap;
+    }
+
+    .stats-table {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .stat {
+      padding: 14px 14px 12px;
+      border-radius: 18px;
+      background: rgba(255, 249, 241, 0.94);
+      border: 1px solid rgba(122, 71, 22, 0.10);
+    }
+
+    .stat .k {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .stat .v {
+      margin-top: 8px;
+      font-size: 18px;
+      font-weight: 800;
+    }
+
+    .chart-shell {
+      padding: 16px;
+      border-radius: 22px;
+      background:
+        linear-gradient(180deg, rgba(255, 252, 248, 0.96), rgba(251, 244, 235, 0.95));
+      border: 1px solid rgba(122, 71, 22, 0.10);
+    }
+
+    .chart-caption {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    svg {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    .status-card {
+      padding: 22px 24px;
+    }
+
+    .status-text {
+      margin: 0;
+      line-height: 1.7;
+      color: var(--muted);
+    }
+
+    .status-text strong {
+      color: var(--text);
+    }
+
+    .status-ok {
+      color: var(--good);
+    }
+
+    .status-warn {
+      color: var(--warning);
+    }
+
+    .empty-state {
+      padding: 32px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px dashed rgba(122, 71, 22, 0.2);
+      border-radius: 22px;
+      background: rgba(255, 250, 244, 0.7);
+    }
+
+    .footer-note {
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    @media (max-width: 980px) {
+      .control-grid,
+      .summary-grid,
+      .metric-grid,
+      .stats-table {
+        grid-template-columns: 1fr;
+      }
+
+      .metric-head,
+      .chart-caption {
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <span class="eyebrow">CSV Distribution Studio</span>
+      <h1>RTA / RMises 数据分布图</h1>
+      <p>
+        上传包含 <code>RTA</code> 和 <code>RMises</code> 列的 CSV 文件，页面会自动识别字段并生成分布直方图、均值/中位数标记和统计摘要。
+        支持拖拽上传，也支持手动切换列映射与分箱数量。
+      </p>
+    </section>
+
+    <section class="grid control-grid">
+      <div class="card upload-card">
+        <div id="dropzone" class="dropzone" role="button" tabindex="0" aria-label="上传 CSV">
+          <h2>把 CSV 拖到这里，或者点击选择</h2>
+          <p>
+            推荐上传 `nodes.csv` 或任何包含 `RTA` / `RMises` 数值列的表格。
+            页面完全在浏览器本地解析，不需要启动后端服务。
+          </p>
+          <span class="cta">选择 CSV 文件</span>
+          <div class="upload-hints">
+            <span class="tag">自动识别逗号 / 分号 / Tab 分隔</span>
+            <span class="tag">支持大小写不一致列名</span>
+            <span class="tag">可视化缺失值与有效值数量</span>
+          </div>
+        </div>
+        <input id="fileInput" class="hidden" type="file" accept=".csv,text/csv" />
+        <p id="fileMeta" class="footer-note">尚未上传文件。</p>
+      </div>
+
+      <aside class="card controls-card">
+        <div class="control-block">
+          <label for="rtaSelect">RTA 列</label>
+          <select id="rtaSelect" disabled>
+            <option>上传 CSV 后可选择</option>
+          </select>
+        </div>
+        <div class="control-block">
+          <label for="rmisesSelect">RMises 列</label>
+          <select id="rmisesSelect" disabled>
+            <option>上传 CSV 后可选择</option>
+          </select>
+        </div>
+        <div class="control-block">
+          <label for="binsRange">分箱数量</label>
+          <div class="range-row">
+            <input id="binsRange" type="range" min="8" max="60" value="24" />
+            <span id="binsValue" class="range-value">24</span>
+          </div>
+        </div>
+        <div class="control-block">
+          <label>说明</label>
+          <p class="status-text">
+            直方图显示频数分布；虚线表示均值，实线表示中位数。若上传文件里列名不是标准的
+            <code>RTA</code> / <code>RMises</code>，可以在这里手动切换。
+          </p>
+        </div>
+      </aside>
+    </section>
+
+    <section class="grid summary-grid" id="summaryGrid">
+      <div class="card summary-card">
+        <div class="label">总行数</div>
+        <div class="value" id="totalRowsValue">0</div>
+        <div class="detail">CSV 载入后会统计全部数据行。</div>
+      </div>
+      <div class="card summary-card">
+        <div class="label">识别列数</div>
+        <div class="value" id="columnCountValue">0</div>
+        <div class="detail">用于确认列映射是否正确。</div>
+      </div>
+      <div class="card summary-card">
+        <div class="label">RTA 有效值</div>
+        <div class="value" id="rtaCountValue">0</div>
+        <div class="detail">只统计可解析成数值的记录。</div>
+      </div>
+      <div class="card summary-card">
+        <div class="label">RMises 有效值</div>
+        <div class="value" id="rmisesCountValue">0</div>
+        <div class="detail">缺失或非法数据会自动剔除。</div>
+      </div>
+    </section>
+
+    <section class="card status-card">
+      <p id="statusText" class="status-text">
+        <strong>当前状态：</strong>等待上传 CSV 文件。
+      </p>
+    </section>
+
+    <section id="emptyState" class="empty-state">
+      上传一个 CSV 文件后，这里会显示 `RTA` 和 `RMises` 的数据分布图与统计摘要。
+    </section>
+
+    <section id="metricsSection" class="grid metric-grid hidden"></section>
+  </main>
+
+  <script>
+    const state = {
+      headers: [],
+      rows: [],
+      fileName: "",
+      delimiter: ",",
+    };
+
+    const units = {
+      RTA: "mm/s^2",
+      RMises: "MPa",
+    };
+
+    const palette = {
+      RTA: {
+        fill: "#bf5a36",
+        fillSoft: "rgba(191, 90, 54, 0.18)",
+        stroke: "#8c3f21",
+      },
+      RMises: {
+        fill: "#1f6f78",
+        fillSoft: "rgba(31, 111, 120, 0.18)",
+        stroke: "#12474d",
+      },
+      mean: "#9d3e24",
+      median: "#0f4f5a",
+      axis: "#a48a70",
+      grid: "rgba(122, 104, 85, 0.16)",
+      text: "#5f4b39",
+    };
+
+    const fileInput = document.getElementById("fileInput");
+    const dropzone = document.getElementById("dropzone");
+    const fileMeta = document.getElementById("fileMeta");
+    const rtaSelect = document.getElementById("rtaSelect");
+    const rmisesSelect = document.getElementById("rmisesSelect");
+    const binsRange = document.getElementById("binsRange");
+    const binsValue = document.getElementById("binsValue");
+    const statusText = document.getElementById("statusText");
+    const metricsSection = document.getElementById("metricsSection");
+    const emptyState = document.getElementById("emptyState");
+
+    const totalRowsValue = document.getElementById("totalRowsValue");
+    const columnCountValue = document.getElementById("columnCountValue");
+    const rtaCountValue = document.getElementById("rtaCountValue");
+    const rmisesCountValue = document.getElementById("rmisesCountValue");
+
+    function formatNumber(value, digits = 2) {
+      if (!Number.isFinite(value)) {
+        return "--";
+      }
+      return new Intl.NumberFormat("zh-CN", {
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function formatScientificIfNeeded(value) {
+      if (!Number.isFinite(value)) {
+        return "--";
+      }
+      const abs = Math.abs(value);
+      if ((abs > 0 && abs < 0.01) || abs >= 1e6) {
+        return value.toExponential(3);
+      }
+      return formatNumber(value, 3);
+    }
+
+    function normalizeHeader(name) {
+      return String(name || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+    }
+
+    function detectDelimiter(text) {
+      const firstLine = (text || "").split(/\r?\n/, 1)[0] || "";
+      const candidates = [",", ";", "\t"];
+      let best = ",";
+      let bestCount = -1;
+      for (const delimiter of candidates) {
+        const count = countDelimitedFields(firstLine, delimiter);
+        if (count > bestCount) {
+          bestCount = count;
+          best = delimiter;
+        }
+      }
+      return best;
+    }
+
+    function countDelimitedFields(line, delimiter) {
+      let count = 1;
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i += 1) {
+        const char = line[i];
+        if (char === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            i += 1;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (!inQuotes && char === delimiter) {
+          count += 1;
+        }
+      }
+      return count;
+    }
+
+    function parseCSV(text, delimiter) {
+      const rows = [];
+      let row = [];
+      let cell = "";
+      let inQuotes = false;
+
+      for (let i = 0; i < text.length; i += 1) {
+        const char = text[i];
+        const next = text[i + 1];
+
+        if (char === '"') {
+          if (inQuotes && next === '"') {
+            cell += '"';
+            i += 1;
+          } else {
+            inQuotes = !inQuotes;
+          }
+          continue;
+        }
+
+        if (!inQuotes && char === delimiter) {
+          row.push(cell);
+          cell = "";
+          continue;
+        }
+
+        if (!inQuotes && (char === "\n" || char === "\r")) {
+          if (char === "\r" && next === "\n") {
+            i += 1;
+          }
+          row.push(cell);
+          if (row.some(value => value !== "")) {
+            rows.push(row);
+          }
+          row = [];
+          cell = "";
+          continue;
+        }
+
+        cell += char;
+      }
+
+      if (cell !== "" || row.length > 0) {
+        row.push(cell);
+        if (row.some(value => value !== "")) {
+          rows.push(row);
+        }
+      }
+
+      return rows;
+    }
+
+    function buildRowObjects(parsedRows) {
+      if (!parsedRows.length) {
+        return { headers: [], rows: [] };
+      }
+      const headers = parsedRows[0].map((value, index) => {
+        const cleaned = String(value || "").trim();
+        return index === 0 ? cleaned.replace(/^\uFEFF/, "") : cleaned;
+      });
+      const rows = parsedRows.slice(1).map(raw => {
+        const obj = {};
+        headers.forEach((header, index) => {
+          obj[header] = raw[index] ?? "";
+        });
+        return obj;
+      });
+      return { headers, rows };
+    }
+
+    function findBestColumn(headers, target) {
+      const normalizedTarget = normalizeHeader(target);
+      const exact = headers.find(header => normalizeHeader(header) === normalizedTarget);
+      if (exact) {
+        return exact;
+      }
+      const partial = headers.find(header => normalizeHeader(header).includes(normalizedTarget));
+      return partial || "";
+    }
+
+    function toNumericSeries(rows, column) {
+      let missing = 0;
+      let invalid = 0;
+      const values = [];
+
+      rows.forEach(row => {
+        const raw = column ? row[column] : "";
+        const trimmed = String(raw ?? "").trim();
+        if (trimmed === "") {
+          missing += 1;
+          return;
+        }
+        const value = Number(trimmed);
+        if (Number.isFinite(value)) {
+          values.push(value);
+        } else {
+          invalid += 1;
+        }
+      });
+
+      return { values, missing, invalid };
+    }
+
+    function quantile(sorted, q) {
+      if (!sorted.length) {
+        return NaN;
+      }
+      const pos = (sorted.length - 1) * q;
+      const base = Math.floor(pos);
+      const rest = pos - base;
+      const next = sorted[base + 1];
+      if (next === undefined) {
+        return sorted[base];
+      }
+      return sorted[base] + rest * (next - sorted[base]);
+    }
+
+    function computeStats(values) {
+      if (!values.length) {
+        return null;
+      }
+      const sorted = [...values].sort((a, b) => a - b);
+      const count = sorted.length;
+      const min = sorted[0];
+      const max = sorted[count - 1];
+      const mean = sorted.reduce((sum, value) => sum + value, 0) / count;
+      const median = quantile(sorted, 0.5);
+      const q1 = quantile(sorted, 0.25);
+      const q3 = quantile(sorted, 0.75);
+      const p95 = quantile(sorted, 0.95);
+      const variance = sorted.reduce((sum, value) => sum + (value - mean) ** 2, 0) / count;
+      const std = Math.sqrt(variance);
+      return { count, min, max, mean, median, q1, q3, p95, std };
+    }
+
+    function buildHistogram(values, binCount) {
+      if (!values.length) {
+        return null;
+      }
+      let min = values[0];
+      let max = values[0];
+      for (let i = 1; i < values.length; i += 1) {
+        const value = values[i];
+        if (value < min) {
+          min = value;
+        }
+        if (value > max) {
+          max = value;
+        }
+      }
+      if (min === max) {
+        return {
+          bins: [{ start: min, end: max, count: values.length }],
+          min,
+          max,
+          maxCount: values.length,
+        };
+      }
+      const width = (max - min) / binCount;
+      const bins = Array.from({ length: binCount }, (_, index) => ({
+        start: min + index * width,
+        end: index === binCount - 1 ? max : min + (index + 1) * width,
+        count: 0,
+      }));
+
+      values.forEach(value => {
+        const normalized = (value - min) / (max - min);
+        let index = Math.floor(normalized * binCount);
+        if (index >= binCount) {
+          index = binCount - 1;
+        }
+        bins[index].count += 1;
+      });
+
+      return {
+        bins,
+        min,
+        max,
+        maxCount: Math.max(...bins.map(bin => bin.count)),
+      };
+    }
+
+    function makeStatsTable(stats, unit) {
+      if (!stats) {
+        return "";
+      }
+      const items = [
+        ["最小值", `${formatScientificIfNeeded(stats.min)} ${unit}`],
+        ["最大值", `${formatScientificIfNeeded(stats.max)} ${unit}`],
+        ["均值", `${formatScientificIfNeeded(stats.mean)} ${unit}`],
+        ["中位数", `${formatScientificIfNeeded(stats.median)} ${unit}`],
+        ["Q1", `${formatScientificIfNeeded(stats.q1)} ${unit}`],
+        ["Q3", `${formatScientificIfNeeded(stats.q3)} ${unit}`],
+        ["P95", `${formatScientificIfNeeded(stats.p95)} ${unit}`],
+        ["标准差", `${formatScientificIfNeeded(stats.std)} ${unit}`],
+      ];
+
+      return items.map(([k, v]) => `
+        <div class="stat">
+          <div class="k">${k}</div>
+          <div class="v">${v}</div>
+        </div>
+      `).join("");
+    }
+
+    function lineX(value, min, max, chartWidth, leftPad) {
+      if (max === min) {
+        return leftPad + chartWidth / 2;
+      }
+      return leftPad + ((value - min) / (max - min)) * chartWidth;
+    }
+
+    function renderHistogramSvg(metricName, stats, histogram) {
+      const width = 760;
+      const height = 320;
+      const leftPad = 58;
+      const rightPad = 18;
+      const topPad = 16;
+      const bottomPad = 44;
+      const chartWidth = width - leftPad - rightPad;
+      const chartHeight = height - topPad - bottomPad;
+
+      const barGap = 4;
+      const barWidth = Math.max(4, (chartWidth - (histogram.bins.length - 1) * barGap) / histogram.bins.length);
+      const color = palette[metricName];
+      const yTicks = 4;
+      const grid = [];
+      const bars = [];
+
+      for (let i = 0; i <= yTicks; i += 1) {
+        const yValue = (histogram.maxCount / yTicks) * i;
+        const y = topPad + chartHeight - (histogram.maxCount === 0 ? 0 : (yValue / histogram.maxCount) * chartHeight);
+        grid.push(`
+          <line x1="${leftPad}" y1="${y}" x2="${width - rightPad}" y2="${y}" stroke="${palette.grid}" stroke-width="1" />
+          <text x="${leftPad - 10}" y="${y + 4}" text-anchor="end" font-size="12" fill="${palette.text}">
+            ${Math.round(yValue)}
+          </text>
+        `);
+      }
+
+      histogram.bins.forEach((bin, index) => {
+        const x = leftPad + index * (barWidth + barGap);
+        const barHeight = histogram.maxCount === 0 ? 0 : (bin.count / histogram.maxCount) * chartHeight;
+        const y = topPad + chartHeight - barHeight;
+        const center = x + barWidth / 2;
+        const labelEvery = Math.max(1, Math.ceil(histogram.bins.length / 6));
+        const shouldLabel = index % labelEvery === 0 || index === histogram.bins.length - 1;
+
+        bars.push(`
+          <g>
+            <rect
+              x="${x}"
+              y="${y}"
+              width="${barWidth}"
+              height="${Math.max(barHeight, 1)}"
+              rx="8"
+              fill="${color.fillSoft}"
+              stroke="${color.fill}"
+              stroke-width="1.2"
+            />
+            ${shouldLabel ? `
+              <text x="${center}" y="${height - 14}" text-anchor="middle" font-size="11" fill="${palette.text}">
+                ${formatNumber(bin.start, 1)}
+              </text>` : ""}
+          </g>
+        `);
+      });
+
+      const meanX = lineX(stats.mean, histogram.min, histogram.max, chartWidth, leftPad);
+      const medianX = lineX(stats.median, histogram.min, histogram.max, chartWidth, leftPad);
+
+      return `
+        <svg viewBox="0 0 ${width} ${height}" aria-label="${metricName} 直方图">
+          <line x1="${leftPad}" y1="${topPad + chartHeight}" x2="${width - rightPad}" y2="${topPad + chartHeight}" stroke="${palette.axis}" stroke-width="1.4" />
+          <line x1="${leftPad}" y1="${topPad}" x2="${leftPad}" y2="${topPad + chartHeight}" stroke="${palette.axis}" stroke-width="1.4" />
+          ${grid.join("")}
+          ${bars.join("")}
+          <line x1="${meanX}" y1="${topPad}" x2="${meanX}" y2="${topPad + chartHeight}" stroke="${palette.mean}" stroke-width="2.2" stroke-dasharray="6 6" />
+          <line x1="${medianX}" y1="${topPad}" x2="${medianX}" y2="${topPad + chartHeight}" stroke="${palette.median}" stroke-width="2.2" />
+          <text x="${width - rightPad}" y="${height - 14}" text-anchor="end" font-size="12" fill="${palette.text}">
+            ${formatNumber(histogram.max, 1)}
+          </text>
+          <text x="16" y="20" font-size="12" fill="${palette.text}">频数</text>
+        </svg>
+      `;
+    }
+
+    function renderMetricCard(metricName, columnName, series, binCount) {
+      const stats = computeStats(series.values);
+      if (!stats) {
+        return `
+          <article class="card metric-card">
+            <div class="metric-head">
+              <div>
+                <h2 class="metric-title">${metricName}</h2>
+                <p class="metric-subtitle">列：${columnName || "未选择"}</p>
+              </div>
+              <span class="metric-badge">无可用数值</span>
+            </div>
+            <div class="empty-state">当前列没有可解析的数值，无法生成分布图。</div>
+          </article>
+        `;
+      }
+
+      const histogram = buildHistogram(series.values, binCount);
+      const unit = units[metricName] || "";
+      return `
+        <article class="card metric-card">
+          <div class="metric-head">
+            <div>
+              <h2 class="metric-title">${metricName}</h2>
+              <p class="metric-subtitle">
+                列：<code>${columnName}</code> | 有效值 ${formatNumber(series.values.length, 0)} 条，
+                缺失 ${formatNumber(series.missing, 0)} 条，非法 ${formatNumber(series.invalid, 0)} 条。
+              </p>
+            </div>
+            <span class="metric-badge">${unit}</span>
+          </div>
+
+          <div class="stats-table">
+            ${makeStatsTable(stats, unit)}
+          </div>
+
+          <div class="chart-shell">
+            <div class="chart-caption">
+              <span>直方分布图</span>
+              <span>范围：${formatScientificIfNeeded(stats.min)} 到 ${formatScientificIfNeeded(stats.max)}</span>
+            </div>
+            ${renderHistogramSvg(metricName, stats, histogram)}
+            <div class="legend">
+              <span class="legend-item"><span class="legend-dot" style="background:${palette[metricName].fill};"></span>直方图</span>
+              <span class="legend-item"><span class="legend-dot" style="background:${palette.mean};"></span>均值（虚线）</span>
+              <span class="legend-item"><span class="legend-dot" style="background:${palette.median};"></span>中位数（实线）</span>
+            </div>
+          </div>
+        </article>
+      `;
+    }
+
+    function refreshSelectOptions() {
+      const options = state.headers.map(header => `<option value="${escapeHtml(header)}">${escapeHtml(header)}</option>`).join("");
+
+      rtaSelect.innerHTML = `<option value="">未选择</option>${options}`;
+      rmisesSelect.innerHTML = `<option value="">未选择</option>${options}`;
+
+      rtaSelect.value = findBestColumn(state.headers, "RTA");
+      rmisesSelect.value = findBestColumn(state.headers, "RMises");
+
+      rtaSelect.disabled = state.headers.length === 0;
+      rmisesSelect.disabled = state.headers.length === 0;
+    }
+
+    function updateSummary(rtaSeries, rmisesSeries) {
+      totalRowsValue.textContent = formatNumber(state.rows.length, 0);
+      columnCountValue.textContent = formatNumber(state.headers.length, 0);
+      rtaCountValue.textContent = formatNumber(rtaSeries.values.length, 0);
+      rmisesCountValue.textContent = formatNumber(rmisesSeries.values.length, 0);
+    }
+
+    function updateStatus(rtaColumn, rmisesColumn, rtaSeries, rmisesSeries) {
+      const warnings = [];
+      if (!rtaColumn) {
+        warnings.push("未选中 RTA 列");
+      }
+      if (!rmisesColumn) {
+        warnings.push("未选中 RMises 列");
+      }
+      if (rtaColumn && rtaSeries.values.length === 0) {
+        warnings.push("RTA 列没有有效数值");
+      }
+      if (rmisesColumn && rmisesSeries.values.length === 0) {
+        warnings.push("RMises 列没有有效数值");
+      }
+
+      if (warnings.length) {
+        statusText.innerHTML = `<strong>当前状态：</strong><span class="status-warn">${warnings.join("；")}。</span>`;
+        return;
+      }
+
+      statusText.innerHTML = `
+        <strong>当前状态：</strong>
+        <span class="status-ok">
+          已从 <code>${escapeHtml(state.fileName)}</code> 成功提取分布数据，
+          使用列 <code>${escapeHtml(rtaColumn)}</code> 和 <code>${escapeHtml(rmisesColumn)}</code> 完成可视化。
+        </span>
+      `;
+    }
+
+    function renderAll() {
+      if (!state.rows.length) {
+        totalRowsValue.textContent = "0";
+        columnCountValue.textContent = formatNumber(state.headers.length, 0);
+        rtaCountValue.textContent = "0";
+        rmisesCountValue.textContent = "0";
+        statusText.innerHTML = state.headers.length
+          ? `<strong>当前状态：</strong><span class="status-warn">文件已读取，但没有可视化数据行。</span>`
+          : `<strong>当前状态：</strong>等待上传 CSV 文件。`;
+        metricsSection.innerHTML = "";
+        metricsSection.classList.add("hidden");
+        emptyState.classList.remove("hidden");
+        return;
+      }
+
+      const rtaColumn = rtaSelect.value;
+      const rmisesColumn = rmisesSelect.value;
+      const binCount = Number(binsRange.value);
+      const rtaSeries = toNumericSeries(state.rows, rtaColumn);
+      const rmisesSeries = toNumericSeries(state.rows, rmisesColumn);
+
+      updateSummary(rtaSeries, rmisesSeries);
+      updateStatus(rtaColumn, rmisesColumn, rtaSeries, rmisesSeries);
+
+      metricsSection.innerHTML = [
+        renderMetricCard("RTA", rtaColumn, rtaSeries, binCount),
+        renderMetricCard("RMises", rmisesColumn, rmisesSeries, binCount),
+      ].join("");
+
+      metricsSection.classList.remove("hidden");
+      emptyState.classList.add("hidden");
+    }
+
+    function handleFile(file) {
+      if (!file) {
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = event => {
+        const text = String(event.target?.result || "");
+        const delimiter = detectDelimiter(text);
+        const parsed = parseCSV(text, delimiter);
+        const { headers, rows } = buildRowObjects(parsed);
+
+        state.headers = headers;
+        state.rows = rows;
+        state.fileName = file.name;
+        state.delimiter = delimiter;
+
+        refreshSelectOptions();
+        fileMeta.innerHTML = `
+          已载入文件 <code>${escapeHtml(file.name)}</code>，
+          分隔符识别为 <code>${delimiter === "\t" ? "Tab" : delimiter}</code>，
+          共 <strong>${formatNumber(rows.length, 0)}</strong> 行数据。
+        `;
+        renderAll();
+      };
+
+      reader.onerror = () => {
+        statusText.innerHTML = `<strong>当前状态：</strong><span class="status-warn">文件读取失败，请重新选择 CSV。</span>`;
+      };
+
+      reader.readAsText(file, "utf-8");
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    dropzone.addEventListener("click", () => fileInput.click());
+    dropzone.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        fileInput.click();
+      }
+    });
+
+    ["dragenter", "dragover"].forEach(name => {
+      dropzone.addEventListener(name, event => {
+        event.preventDefault();
+        dropzone.classList.add("dragover");
+      });
+    });
+
+    ["dragleave", "dragend", "drop"].forEach(name => {
+      dropzone.addEventListener(name, event => {
+        event.preventDefault();
+        dropzone.classList.remove("dragover");
+      });
+    });
+
+    dropzone.addEventListener("drop", event => {
+      const file = event.dataTransfer?.files?.[0];
+      handleFile(file);
+    });
+
+    fileInput.addEventListener("change", event => {
+      const file = event.target.files?.[0];
+      handleFile(file);
+    });
+
+    binsRange.addEventListener("input", () => {
+      binsValue.textContent = binsRange.value;
+      if (state.rows.length) {
+        renderAll();
+      }
+    });
+
+    rtaSelect.addEventListener("change", renderAll);
+    rmisesSelect.addEventListener("change", renderAll);
+  </script>
+</body>
+</html>
