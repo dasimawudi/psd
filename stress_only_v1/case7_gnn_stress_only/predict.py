@@ -16,6 +16,7 @@ from case7_gnn_stress_only.trainer import (
     PreparedCase,
     build_model,
     decode_field_prediction,
+    get_stress_peak_relative_cfg,
     get_two_stage_rmises_cfg,
     prepare_case,
 )
@@ -124,11 +125,13 @@ def main() -> None:
 
     clamp_negative_rmises = bool(config["dataset"].get("clamp_negative_rmises", True))
     two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
+    stress_peak_relative_cfg = get_stress_peak_relative_cfg(config)
     prediction_raw, hotspot_prob, hotspot_mask = decode_field_prediction(
         prediction=prediction,
         target_scaler=target_scaler,
         clamp_negative_rmises=clamp_negative_rmises,
         two_stage_rmises_cfg=two_stage_rmises_cfg,
+        stress_peak_relative_cfg=stress_peak_relative_cfg,
     )
     prediction_raw = prediction_raw.detach().cpu()
 
@@ -153,6 +156,7 @@ def main() -> None:
         "rows": int(len(output_df)),
         "output_csv": str(output_dir / "field_prediction.csv"),
         "two_stage_hotspot": bool(two_stage_rmises_cfg["enabled"]),
+        "peak_relative_stress": bool(stress_peak_relative_cfg["enabled"]),
     }
     write_json(output_dir / "field_prediction_summary.json", summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False))

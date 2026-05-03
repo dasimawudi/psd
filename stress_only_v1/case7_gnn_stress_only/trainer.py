@@ -100,6 +100,15 @@ def get_stress_hotspot_metric_cfg(config: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
+def get_stress_peak_relative_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    raw_cfg = dict(config.get("stress_peak_relative", {}))
+    return {
+        "enabled": bool(raw_cfg.get("enabled", False)),
+        "peak_loss_weight": float(raw_cfg.get("peak_loss_weight", 1.0)),
+        "relative_loss_weight": float(raw_cfg.get("relative_loss_weight", 0.5)),
+    }
+
+
 def _column_index(column_names: list[str] | tuple[str, ...] | Any, target_name: str) -> int | None:
     names = list(column_names)
     try:
@@ -272,28 +281,48 @@ def build_augmented_node_features(
     return torch.cat([case.node_features] + physics_features, dim=-1)
 
 
+def _stress_output_start(two_stage_rmises_cfg: dict[str, Any]) -> int:
+    return 1 if bool(two_stage_rmises_cfg["enabled"]) else 0
+
+
+def compute_stress_prediction_normalized(
+    prediction: torch.Tensor,
+    two_stage_rmises_cfg: dict[str, Any],
+    stress_peak_relative_cfg: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    peak_relative_cfg = stress_peak_relative_cfg or {"enabled": False}
+    stress_start = _stress_output_start(two_stage_rmises_cfg)
+    if bool(peak_relative_cfg["enabled"]):
+        relative_drop = F.softplus(prediction[:, stress_start])
+        peak_prediction = prediction[:, stress_start + 1]
+        stress_prediction = peak_prediction - relative_drop
+        return stress_prediction, peak_prediction, relative_drop
+
+    return prediction[:, stress_start], None, None
+
+
 def decode_field_prediction(
     prediction: torch.Tensor,
     target_scaler: StandardScaler,
     clamp_negative_rmises: bool,
     two_stage_rmises_cfg: dict[str, Any],
+    stress_peak_relative_cfg: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    if two_stage_rmises_cfg["enabled"]:
-        prediction_encoded = target_scaler.inverse_transform(prediction[:, 1:2])
-        prediction_raw = decode_field_targets(
-            prediction_encoded,
-            clamp_negative_rmises=clamp_negative_rmises,
-            rmises_as_excess=False,
-        )
-        hotspot_prob = torch.sigmoid(prediction[:, 0])
-        hotspot_mask = hotspot_prob >= float(two_stage_rmises_cfg["prob_threshold"])
-        return prediction_raw, hotspot_prob, hotspot_mask
-
-    prediction_encoded = target_scaler.inverse_transform(prediction)
+    stress_prediction, _, _ = compute_stress_prediction_normalized(
+        prediction,
+        two_stage_rmises_cfg=two_stage_rmises_cfg,
+        stress_peak_relative_cfg=stress_peak_relative_cfg,
+    )
+    prediction_encoded = target_scaler.inverse_transform(stress_prediction.unsqueeze(-1))
     prediction_raw = decode_field_targets(
         prediction_encoded,
         clamp_negative_rmises=clamp_negative_rmises,
     )
+    if two_stage_rmises_cfg["enabled"]:
+        hotspot_prob = torch.sigmoid(prediction[:, 0])
+        hotspot_mask = hotspot_prob >= float(two_stage_rmises_cfg["prob_threshold"])
+        return prediction_raw, hotspot_prob, hotspot_mask
+
     return prediction_raw, None, None
 
 
@@ -445,6 +474,7 @@ def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.M
     conditioning_cfg = dict(model_cfg.get("conditioning", {}))
     conditioning_enabled = bool(conditioning_cfg.get("enabled", False))
     two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
+    stress_peak_relative_cfg = get_stress_peak_relative_cfg(config)
 
     common_kwargs = dict(
         node_input_dim=int(sample_case.node_features.size(-1)),
@@ -461,10 +491,12 @@ def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.M
     if task == "frequency":
         return FrequencyGNN(output_dim=int(sample_case.target_normalized.numel()), **common_kwargs)
     if task == "field":
+        stress_output_dim = 2 if bool(stress_peak_relative_cfg["enabled"]) else int(sample_case.target_normalized.size(-1))
         return FieldGNN(
-            output_dim=2 if bool(two_stage_rmises_cfg["enabled"]) else int(sample_case.target_normalized.size(-1)),
+            output_dim=(1 if bool(two_stage_rmises_cfg["enabled"]) else 0) + stress_output_dim,
             rmises_refine_layers=int(model_cfg.get("rmises_refine_layers", max(1, int(model_cfg["num_layers"]) - 1))),
             use_two_stage_rmises=bool(two_stage_rmises_cfg["enabled"]),
+            use_peak_relative_stress=bool(stress_peak_relative_cfg["enabled"]),
             **common_kwargs,
         )
     raise ValueError(f"Unsupported task: {task}")
@@ -512,10 +544,20 @@ def compute_field_loss(
     loss_name: str,
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
+    stress_peak_relative_cfg: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
+    peak_relative_cfg = stress_peak_relative_cfg or {
+        "enabled": False,
+        "peak_loss_weight": 1.0,
+        "relative_loss_weight": 0.0,
+    }
     cfg = field_loss_cfg or {}
-    stress_channel = 1 if bool(two_stage_cfg["enabled"]) else 0
+    stress_prediction, stress_peak_prediction, stress_relative_drop = compute_stress_prediction_normalized(
+        prediction,
+        two_stage_rmises_cfg=two_stage_cfg,
+        stress_peak_relative_cfg=peak_relative_cfg,
+    )
     physics_stress_smoothness_weight = float(
         cfg.get("physics_stress_smoothness_weight", cfg.get("physics_rmises_smoothness_weight", 0.0))
     )
@@ -540,7 +582,7 @@ def compute_field_loss(
         if edge_mask.any():
             edge_distance = batch.edge_distance.clamp_min(1e-6).pow(physics_distance_power)
             edge_norm = edge_distance[edge_mask]
-            stress_edge_residual = (prediction[src, stress_channel] - prediction[dst, stress_channel]).pow(2)
+            stress_edge_residual = (stress_prediction[src] - stress_prediction[dst]).pow(2)
             physics_loss = physics_loss + physics_stress_smoothness_weight * (
                 stress_edge_residual[edge_mask] / edge_norm
             ).mean()
@@ -571,7 +613,6 @@ def compute_field_loss(
         cfg.get("stress_case_activity_max_weight", cfg.get("rmises_case_activity_max_weight", 1.0))
     )
 
-    stress_prediction = prediction[:, stress_channel]
     stress_target = target[:, 0]
     stress_loss = compute_pointwise_loss(stress_prediction, stress_target, loss_name=loss_name)
     stress_values = target_metric[:, 0].clamp_min(0.0)
@@ -622,12 +663,33 @@ def compute_field_loss(
         extra_hotspot_loss = stress_loss[topk_indices].mean() * stress_topk_weight
 
     peak_loss = stress_loss.new_zeros(())
-    if stress_peak_weight > 0.0 and stress_prediction.numel() > 0:
+    peak_loss_weight = (
+        float(peak_relative_cfg["peak_loss_weight"])
+        if bool(peak_relative_cfg["enabled"])
+        else stress_peak_weight
+    )
+    if peak_loss_weight > 0.0 and stress_prediction.numel() > 0:
+        peak_prediction_for_loss = (
+            stress_peak_prediction[:1]
+            if bool(peak_relative_cfg["enabled"]) and stress_peak_prediction is not None
+            else stress_prediction.max().reshape(1)
+        )
         peak_loss = compute_pointwise_loss(
-            stress_prediction.max().reshape(1),
+            peak_prediction_for_loss,
             stress_target.max().reshape(1),
             loss_name=loss_name,
-        ).mean() * stress_peak_weight
+        ).mean() * peak_loss_weight
+
+    relative_loss = stress_loss.new_zeros(())
+    if bool(peak_relative_cfg["enabled"]) and stress_relative_drop is not None:
+        relative_loss_weight = float(peak_relative_cfg["relative_loss_weight"])
+        if relative_loss_weight > 0.0 and stress_target.numel() > 0:
+            target_relative_drop = (stress_target.max() - stress_target).clamp_min(0.0)
+            relative_loss = compute_pointwise_loss(
+                stress_relative_drop,
+                target_relative_drop,
+                loss_name=loss_name,
+            ).mean() * relative_loss_weight
 
     if bool(two_stage_cfg["enabled"]):
         hotspot_target = build_stress_hotspot_targets(stress_values, two_stage_cfg)
@@ -663,9 +725,15 @@ def compute_field_loss(
             + background_reg_loss
             + stress_loss_weight * stress_case_weight * (weighted_stress_loss + extra_hotspot_loss)
             + peak_loss
+            + relative_loss
             + physics_loss
         )
-    return stress_loss_weight * stress_case_weight * (weighted_stress_loss + extra_hotspot_loss) + peak_loss + physics_loss
+    return (
+        stress_loss_weight * stress_case_weight * (weighted_stress_loss + extra_hotspot_loss)
+        + peak_loss
+        + relative_loss
+        + physics_loss
+    )
 
 
 def compute_loss(
@@ -677,6 +745,7 @@ def compute_loss(
     batch: PreparedCase | None = None,
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
+    stress_peak_relative_cfg: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     if task == "field":
         if target_metric is None:
@@ -689,6 +758,7 @@ def compute_loss(
             loss_name=loss_name,
             field_loss_cfg=field_loss_cfg,
             two_stage_rmises_cfg=two_stage_rmises_cfg,
+            stress_peak_relative_cfg=stress_peak_relative_cfg,
         )
     if loss_name == "mse":
         return F.mse_loss(prediction, target)
@@ -752,9 +822,11 @@ def evaluate_field(
     loss_name: str,
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
+    stress_peak_relative_cfg: dict[str, Any] | None = None,
     hotspot_metric_cfg: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
+    peak_relative_cfg = stress_peak_relative_cfg or {"enabled": False}
     metric_hotspot_cfg = hotspot_metric_cfg or CANONICAL_STRESS_HOTSPOT_METRIC_CFG
     scaler = target_scaler.to(device)
     total_loss = 0.0
@@ -792,6 +864,7 @@ def evaluate_field(
                 batch=batch,
                 field_loss_cfg=field_loss_cfg,
                 two_stage_rmises_cfg=two_stage_cfg,
+                stress_peak_relative_cfg=peak_relative_cfg,
             )
             node_count = int(batch.node_features.size(0))
             total_loss += loss.item() * node_count
@@ -802,6 +875,7 @@ def evaluate_field(
                 target_scaler=scaler,
                 clamp_negative_rmises=clamp_negative_rmises,
                 two_stage_rmises_cfg=two_stage_cfg,
+                stress_peak_relative_cfg=peak_relative_cfg,
             )
             prediction_raw = prediction_raw.detach().cpu()
             target_raw = batch.target_metric.detach().cpu()
@@ -876,6 +950,7 @@ def train_one_epoch(
     task: str = "frequency",
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
+    stress_peak_relative_cfg: dict[str, Any] | None = None,
 ) -> float:
     model.train()
     shuffled = list(case_paths)
@@ -902,6 +977,7 @@ def train_one_epoch(
             batch=batch if task == "field" else None,
             field_loss_cfg=field_loss_cfg,
             two_stage_rmises_cfg=two_stage_rmises_cfg,
+            stress_peak_relative_cfg=stress_peak_relative_cfg,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -940,6 +1016,7 @@ class Case7Trainer:
         self.training_cfg = config["training"]
         self.field_loss_cfg = dict(config.get("field_loss", {}))
         self.two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
+        self.stress_peak_relative_cfg = get_stress_peak_relative_cfg(config)
         self.hotspot_metric_cfg = get_stress_hotspot_metric_cfg(config)
         self.feature_cfg = dict(config.get("features", {}))
         self.use_psd = bool(self.feature_cfg["use_psd"])
@@ -1039,6 +1116,7 @@ class Case7Trainer:
         resolved_dataset["test_cases"] = list(self.split_names.get("test", []))
         self.resolved_config = dict(self.config)
         self.resolved_config["dataset"] = resolved_dataset
+        self.resolved_config["stress_peak_relative"] = dict(self.stress_peak_relative_cfg)
         self.resolved_config["stress_hotspot_metric"] = dict(self.hotspot_metric_cfg)
         write_yaml(self.save_dir / "resolved_config.yaml", self.resolved_config)
 
@@ -1064,6 +1142,7 @@ class Case7Trainer:
             loss_name=loss_name,
             field_loss_cfg=self.field_loss_cfg,
             two_stage_rmises_cfg=self.two_stage_rmises_cfg,
+            stress_peak_relative_cfg=self.stress_peak_relative_cfg,
             hotspot_metric_cfg=self.hotspot_metric_cfg,
         )
 
@@ -1109,6 +1188,15 @@ class Case7Trainer:
             self.logger.info("Two-stage stress hotspot: %s", bool(self.two_stage_rmises_cfg["enabled"]))
             if self.two_stage_rmises_cfg["enabled"]:
                 self.logger.info("Two-stage stress config: %s", json.dumps(self.two_stage_rmises_cfg, ensure_ascii=False))
+            self.logger.info(
+                "Peak-relative stress decomposition: %s",
+                bool(self.stress_peak_relative_cfg["enabled"]),
+            )
+            if self.stress_peak_relative_cfg["enabled"]:
+                self.logger.info(
+                    "Peak-relative stress config: %s",
+                    json.dumps(self.stress_peak_relative_cfg, ensure_ascii=False),
+                )
         if self.task == "field" and self.field_loss_cfg:
             self.logger.info("Field loss config: %s", json.dumps(self.field_loss_cfg, ensure_ascii=False))
         if self.task == "field":
@@ -1137,6 +1225,7 @@ class Case7Trainer:
                 task=self.task,
                 field_loss_cfg=self.field_loss_cfg,
                 two_stage_rmises_cfg=self.two_stage_rmises_cfg,
+                stress_peak_relative_cfg=self.stress_peak_relative_cfg,
             )
 
             history_row = {

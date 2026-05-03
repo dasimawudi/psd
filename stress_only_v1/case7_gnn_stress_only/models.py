@@ -293,16 +293,18 @@ class FieldGNN(nn.Module):
         conditioning_dim: int | None = None,
         enable_conditioning: bool = False,
         use_two_stage_rmises: bool = False,
+        use_peak_relative_stress: bool = False,
     ) -> None:
         super().__init__()
-        expected_output_dim = 2 if use_two_stage_rmises else 1
+        expected_output_dim = (1 if use_two_stage_rmises else 0) + (2 if use_peak_relative_stress else 1)
         if output_dim != expected_output_dim:
             raise ValueError(
-                "Stress-only FieldGNN expects one stress output, or hotspot logit + stress in two-stage mode."
+                "Stress-only FieldGNN output_dim does not match the requested stress heads."
             )
 
         self.enable_conditioning = enable_conditioning
         self.use_two_stage_rmises = use_two_stage_rmises
+        self.use_peak_relative_stress = use_peak_relative_stress
         self.encoder = GraphEncoder(
             node_input_dim=node_input_dim,
             edge_input_dim=edge_input_dim,
@@ -328,6 +330,7 @@ class FieldGNN(nn.Module):
             ]
         )
         stress_context_dim = hidden_dim + hidden_dim + global_dim
+        graph_context_dim = hidden_dim * 2 + global_dim
         if self.use_two_stage_rmises:
             self.hotspot_decoder = build_mlp(
                 input_dim=stress_context_dim,
@@ -378,6 +381,24 @@ class FieldGNN(nn.Module):
                 else None
             )
 
+        if self.use_peak_relative_stress:
+            self.stress_peak_decoder = build_mlp(
+                input_dim=graph_context_dim,
+                hidden_dim=hidden_dim,
+                output_dim=1,
+                num_layers=3,
+                dropout=dropout,
+                final_activation=False,
+            )
+            self.stress_peak_modulation = (
+                FeatureModulation(feature_dim=graph_context_dim, conditioning_dim=conditioning_dim)
+                if enable_conditioning and conditioning_dim is not None
+                else None
+            )
+        else:
+            self.stress_peak_decoder = None
+            self.stress_peak_modulation = None
+
     def forward(
         self,
         node_features: torch.Tensor,
@@ -385,7 +406,7 @@ class FieldGNN(nn.Module):
         edge_features: torch.Tensor,
         global_features: torch.Tensor,
     ) -> torch.Tensor:
-        node_state, edge_state, _, global_state, conditioning_state = self.encoder(
+        node_state, edge_state, graph_state, global_state, conditioning_state = self.encoder(
             node_features,
             edge_index,
             edge_features,
@@ -411,11 +432,29 @@ class FieldGNN(nn.Module):
                 assert conditioning_state is not None
                 rmises_input = self.rmises_context_modulation(rmises_input, conditioning_state)
             rmises_prediction = self.rmises_decoder(rmises_input)
-            return torch.cat([hotspot_logit, rmises_prediction], dim=-1)
+            outputs = [hotspot_logit, rmises_prediction]
+            if self.use_peak_relative_stress:
+                peak_input = graph_state
+                if self.stress_peak_modulation is not None:
+                    assert conditioning_state is not None
+                    peak_input = self.stress_peak_modulation(peak_input, conditioning_state)
+                assert self.stress_peak_decoder is not None
+                peak_prediction = self.stress_peak_decoder(peak_input.unsqueeze(0)).expand(node_state.size(0), -1)
+                outputs.append(peak_prediction)
+            return torch.cat(outputs, dim=-1)
 
         rmises_input = base_rmises_context
         if self.rmises_context_modulation is not None:
             assert conditioning_state is not None
             rmises_input = self.rmises_context_modulation(rmises_input, conditioning_state)
         rmises_prediction = self.rmises_decoder(rmises_input)
-        return rmises_prediction
+        if not self.use_peak_relative_stress:
+            return rmises_prediction
+
+        peak_input = graph_state
+        if self.stress_peak_modulation is not None:
+            assert conditioning_state is not None
+            peak_input = self.stress_peak_modulation(peak_input, conditioning_state)
+        assert self.stress_peak_decoder is not None
+        peak_prediction = self.stress_peak_decoder(peak_input.unsqueeze(0)).expand(node_state.size(0), -1)
+        return torch.cat([rmises_prediction, peak_prediction], dim=-1)
