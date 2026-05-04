@@ -1,0 +1,98 @@
+task: field
+
+dataset:
+  root: case7new
+  sample_mode: per_frequency
+  include_zero_frequency: false
+  min_frequency_hz: 20.0
+  max_frequency_hz: 2000.0
+  split_mode: ratio
+  split_seed: 42
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  cache_dir: stress_only_v1/.cache/case7new_high_reliability
+  scaler_fit_case_limit: 128
+  node_columns: [x, y, z, bc_mask]
+  edge_columns: [dx, dy, dz, dist]
+  target_freq_key: freq_top3
+  make_undirected: true
+  clamp_negative_rmises: true
+
+features:
+  use_psd: true
+  use_freq_top3: true
+  use_frequency_scalar: true
+  use_frequency_relations: true
+  augment_high_reliability_features: true
+
+model:
+  hidden_dim: 64
+  global_dim: 32
+  num_layers: 3
+  rmises_refine_layers: 2
+  dropout: 0.10
+  conditioning:
+    enabled: true
+    case_dim: 48
+
+training:
+  seed: 42
+  device: auto
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  loss: smooth_l1
+  eval_every: 1
+  print_every: 1
+  early_stopping_patience: 6
+  selection_metric: stress_hotspot_miss25_rate
+  save_dir: stress_only_v1/outputs/stress_single_stage_case7new_log_hotspot_weighted
+
+field_loss:
+  stress_loss_weight: 1.0
+  stress_noise_floor: 1.0
+  stress_low_value_weight: 0.05
+  stress_hotspot_alpha: 8.0
+  stress_hotspot_gamma: 1.5
+  stress_hotspot_quantile: 0.98
+  stress_hotspot_boost: 6.0
+  stress_topk_ratio: 0.01
+  stress_topk_weight: 3.0
+  stress_peak_weight: 0.5
+  stress_case_activity_quantile: 0.99
+  stress_case_activity_reference: 10000.0
+  stress_case_activity_power: 0.5
+  stress_case_activity_min_weight: 0.5
+  stress_case_activity_max_weight: 3.0
+  physics_stress_smoothness_weight: 0.0
+  physics_distance_power: 1.0
+  physics_exclude_boundary_edges: true
+  physics_hotspot_exempt_quantile: 0.98
+
+stress_two_stage:
+  enabled: false
+  threshold: 0.0
+  threshold_quantile: 0.999
+  threshold_peak_ratio: 0.05
+  threshold_combine: min
+  prob_threshold: 0.5
+  classification_weight: 0.0
+  regression_weight: 0.0
+  background_regression_weight: 0.0
+  positive_class_weight: 1.0
+  within_relative_error: 0.25
+
+stress_peak_relative:
+  enabled: false
+  combine_prediction: false
+  peak_loss_weight: 0.0
+  relative_loss_weight: 0.0
+
+stress_hotspot_metric:
+  threshold: 0.0
+  threshold_quantile: 0.999
+  threshold_peak_ratio: 0.05
+  threshold_combine: min
+  within_relative_error: 0.25
