@@ -1369,6 +1369,13 @@ class Case7Trainer:
                     self.logger.info("Epoch %04d | train_loss=%.6f | eval=skipped", epoch, train_loss)
                 continue
 
+            train_metrics, train_diagnostics = self._evaluate(
+                self.train_case_paths,
+                loss_name=self.training_cfg["loss"],
+                collect_diagnostics=True,
+                diagnostic_split="train",
+                diagnostic_epoch=epoch,
+            )
             val_metrics, val_diagnostics = self._evaluate(
                 self.val_case_paths,
                 loss_name=self.training_cfg["loss"],
@@ -1384,8 +1391,12 @@ class Case7Trainer:
                 diagnostic_epoch=epoch,
             )
 
+            history_row["train_eval_loss"] = round(float(train_metrics["loss"]), 8)
             history_row["val_loss"] = round(float(val_metrics["loss"]), 8)
             history_row["test_loss"] = round(float(test_metrics["loss"]), 8)
+            for key, value in train_metrics.items():
+                if key != "loss":
+                    history_row[f"train_{key}"] = round(float(value), 8)
             for key, value in val_metrics.items():
                 if key != "loss":
                     history_row[f"val_{key}"] = round(float(value), 8)
@@ -1396,9 +1407,10 @@ class Case7Trainer:
 
             if epoch == 1 or epoch % int(self.training_cfg["print_every"]) == 0:
                 self.logger.info(
-                    "Epoch %04d | train_loss=%.6f | val=%s | test=%s",
+                    "Epoch %04d | train_loss=%.6f | train_eval=%s | val=%s | test=%s",
                     epoch,
                     train_loss,
+                    json.dumps(train_metrics, ensure_ascii=False),
                     json.dumps(val_metrics, ensure_ascii=False),
                     json.dumps(test_metrics, ensure_ascii=False),
                 )
@@ -1415,6 +1427,7 @@ class Case7Trainer:
                     "train_loss": train_loss,
                     "selection_metric": selection_metric,
                     "selection_score": val_score,
+                    "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
                     "test_metrics": test_metrics,
                 }
@@ -1426,6 +1439,7 @@ class Case7Trainer:
                     metrics=best_payload,
                 )
                 write_json(self.save_dir / "metrics.json", best_payload)
+                write_field_diagnostics_csv(self.save_dir / "best_train_diagnostics.csv", train_diagnostics)
                 write_field_diagnostics_csv(self.save_dir / "best_val_diagnostics.csv", val_diagnostics)
                 write_field_diagnostics_csv(self.save_dir / "best_test_diagnostics.csv", test_diagnostics)
             else:
