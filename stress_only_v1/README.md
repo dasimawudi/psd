@@ -10,6 +10,8 @@ This folder is an isolated first-version branch for hotspot-focused stress predi
   - `MISES_psd_density` for per-frequency samples.
   - `RMises_native` or `RMises` for final-response samples.
 - First-version node augmentation only uses high-reliability features from `x,y,z,bc_mask`, `edges.csv`, and explicit `global.json` fields.
+- Optional modal-shape fusion can add frequency-conditioned `mode_shapes/*.csv`
+  features to both node inputs and global conditioning.
 - The validation selection metric is hotspot-region error, not full-field average error.
 
 ## Model
@@ -23,6 +25,9 @@ This folder is an isolated first-version branch for hotspot-focused stress predi
   - `[hotspot_logit, stress_node_head, stress_peak]` with two-stage hotspot classification
 
 The shared graph encoder is still conditioned by global geometry, PSD, modal frequencies, current frequency, and current-frequency-to-mode relations.
+When modal-shape fusion is enabled, compact mode-shape descriptors are also
+appended to the global feature vector, so they affect case conditioning,
+message passing, and decoding globally.
 
 ## First-version Features
 
@@ -43,6 +48,21 @@ Node features added in `augment_high_reliability_features`:
 - near-center-coupling soft mask
 
 No root fillet, local earpiece hard partition, local thickness, free-surface distance, or center-hole-group distance is used in V1.
+
+Optional modal-shape features:
+
+- `features.use_mode_shapes`: load `mode_shapes/*.csv` and append modal-shape
+  features.
+- `features.mode_shape_global_features`: append compact modal descriptors to
+  the global feature vector.
+- `features.mode_shape_weighting`: current-frequency-to-mode weighting,
+  currently `resonance`, `log_gaussian`, or `inverse_log_gap`.
+- `features.mode_shape_modal_frequency_power`: low-frequency static-compliance
+  decay used by `resonance` weighting.
+- `features.mode_shape_include_nearest`: append the nearest mode's absolute
+  displacement field to node inputs.
+- `features.mode_shape_include_frequency_context`: append nearest modal gap and
+  response weight as node-wise constant features.
 
 ## Optimization Target
 
@@ -97,4 +117,10 @@ Run:
 
 ```powershell
 python stress_only_v1/train_stress_only.py --config stress_only_v1/configs/stress_hotspot_case7new.yaml
+```
+
+Modal-shape ablation:
+
+```powershell
+python stress_only_v1/train_stress_only.py --config stress_only_v1/configs/stress_single_stage_peak_aux_modes_case7new.yaml
 ```

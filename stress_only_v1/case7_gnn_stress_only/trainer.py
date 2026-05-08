@@ -197,14 +197,212 @@ def _infer_earpiece_centers(
     return torch.stack(centers, dim=0)
 
 
+def _requires_mode_shapes(feature_cfg: dict[str, Any] | None) -> bool:
+    return bool((feature_cfg or {}).get("use_mode_shapes", False))
+
+
+def get_mode_shape_loader_kwargs(feature_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = feature_cfg or {}
+    return {
+        "load_mode_shapes": _requires_mode_shapes(cfg),
+        "mode_shape_columns": tuple(cfg.get("mode_shape_columns", ["U1", "U2", "U3", "U_mag"])),
+        "mode_shape_count": cfg.get("mode_shape_count"),
+        "mode_shape_normalization": str(cfg.get("mode_shape_normalization", "max_umag")),
+    }
+
+
+def _mode_shape_column_index(case: Any, column_name: str) -> int:
+    columns = tuple(getattr(case, "mode_shape_columns", ("U1", "U2", "U3", "U_mag")))
+    try:
+        return columns.index(column_name)
+    except ValueError as exc:
+        raise ValueError(f"Mode shape feature '{column_name}' requires column {column_name}") from exc
+
+
+def _modal_response_weights(
+    case: Any,
+    damping_ratio: float,
+    weighting: str,
+    modal_frequency_power: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if case.frequency_scalar.numel() == 0:
+        raise ValueError("Mode shape features require a per-frequency sample with frequency_scalar.")
+    if case.modal_frequencies is None or case.mode_shapes is None:
+        raise ValueError("Mode shape features were requested, but this case did not load mode_shapes data.")
+
+    frequency = case.frequency_scalar.to(dtype=case.mode_shapes.dtype, device=case.mode_shapes.device).flatten()[0]
+    modal_frequencies = case.modal_frequencies.to(dtype=case.mode_shapes.dtype, device=case.mode_shapes.device)
+    modal_frequencies = modal_frequencies.clamp_min(1e-6)
+    safe_frequency = frequency.clamp_min(1e-6)
+    log_gap = torch.abs(torch.log(safe_frequency / modal_frequencies))
+
+    weighting = weighting.lower()
+    if weighting == "resonance":
+        ratio = safe_frequency / modal_frequencies
+        damping = max(float(damping_ratio), 1e-6)
+        weights = torch.rsqrt((1.0 - ratio.pow(2)).pow(2) + (2.0 * damping * ratio).pow(2) + 1e-12)
+        frequency_power = max(float(modal_frequency_power), 0.0)
+        if frequency_power > 0.0:
+            weights = weights / modal_frequencies.pow(frequency_power)
+    elif weighting == "log_gaussian":
+        sigma = max(float(damping_ratio), 1e-6)
+        weights = torch.exp(-0.5 * (log_gap / sigma).pow(2))
+    elif weighting == "inverse_log_gap":
+        weights = 1.0 / (log_gap + max(float(damping_ratio), 1e-6))
+    else:
+        raise ValueError(f"Unsupported mode_shape_weighting: {weighting}")
+
+    weights = weights / weights.sum().clamp_min(1e-12)
+    nearest_index = torch.argmin(log_gap)
+    return weights, nearest_index, log_gap
+
+
+def build_mode_shape_node_features(case: Any, feature_cfg: dict[str, Any] | None = None) -> torch.Tensor | None:
+    cfg = feature_cfg or {}
+    if not _requires_mode_shapes(cfg):
+        return None
+    if case.mode_shapes is None:
+        raise ValueError("features.use_mode_shapes=True, but mode_shapes were not loaded for this case.")
+
+    mode_shapes = case.mode_shapes
+    u1_index = _mode_shape_column_index(case, "U1")
+    u2_index = _mode_shape_column_index(case, "U2")
+    u3_index = _mode_shape_column_index(case, "U3")
+    umag_index = _mode_shape_column_index(case, "U_mag")
+
+    weights, nearest_index, log_gap = _modal_response_weights(
+        case,
+        damping_ratio=float(cfg.get("mode_shape_damping_ratio", 0.02)),
+        weighting=str(cfg.get("mode_shape_weighting", "resonance")),
+        modal_frequency_power=float(cfg.get("mode_shape_modal_frequency_power", 2.0)),
+    )
+
+    abs_xyz = mode_shapes[:, :, [u1_index, u2_index, u3_index]].abs()
+    umag = mode_shapes[:, :, umag_index : umag_index + 1].clamp_min(0.0)
+    weighted_abs_xyz = (abs_xyz * weights.view(1, -1, 1)).sum(dim=1)
+    weighted_umag = (umag * weights.view(1, -1, 1)).sum(dim=1)
+
+    feature_parts = [weighted_abs_xyz, weighted_umag]
+
+    if bool(cfg.get("mode_shape_include_nearest", True)):
+        nearest_abs_xyz = abs_xyz[:, int(nearest_index.item()), :]
+        nearest_umag = umag[:, int(nearest_index.item()), :]
+        feature_parts.extend([nearest_abs_xyz, nearest_umag])
+
+    if bool(cfg.get("mode_shape_include_signed_weighted", False)):
+        signed_xyz = mode_shapes[:, :, [u1_index, u2_index, u3_index]]
+        weighted_signed_xyz = (signed_xyz * weights.view(1, -1, 1)).sum(dim=1)
+        feature_parts.append(weighted_signed_xyz)
+
+    if bool(cfg.get("mode_shape_include_all_umag", False)):
+        feature_parts.append(umag.squeeze(-1))
+
+    if bool(cfg.get("mode_shape_include_frequency_context", True)):
+        node_count = mode_shapes.size(0)
+        nearest_gap = log_gap[nearest_index].view(1, 1).expand(node_count, 1)
+        nearest_weight = weights[nearest_index].view(1, 1).expand(node_count, 1)
+        feature_parts.extend([nearest_gap, nearest_weight])
+
+    return torch.cat(feature_parts, dim=-1)
+
+
+def build_mode_shape_global_features(case: Any, feature_cfg: dict[str, Any] | None = None) -> torch.Tensor | None:
+    cfg = feature_cfg or {}
+    if not _requires_mode_shapes(cfg) or not bool(cfg.get("mode_shape_global_features", True)):
+        return None
+    if case.mode_shapes is None or case.modal_frequencies is None:
+        raise ValueError("Mode shape global features were requested, but this case did not load mode_shapes data.")
+
+    mode_shapes = case.mode_shapes
+    u1_index = _mode_shape_column_index(case, "U1")
+    u2_index = _mode_shape_column_index(case, "U2")
+    u3_index = _mode_shape_column_index(case, "U3")
+    umag_index = _mode_shape_column_index(case, "U_mag")
+
+    weights, nearest_index, log_gap = _modal_response_weights(
+        case,
+        damping_ratio=float(cfg.get("mode_shape_damping_ratio", 0.02)),
+        weighting=str(cfg.get("mode_shape_weighting", "resonance")),
+        modal_frequency_power=float(cfg.get("mode_shape_modal_frequency_power", 2.0)),
+    )
+
+    abs_xyz = mode_shapes[:, :, [u1_index, u2_index, u3_index]].abs()
+    umag = mode_shapes[:, :, umag_index].clamp_min(0.0)
+    weighted_abs_xyz = (abs_xyz * weights.view(1, -1, 1)).sum(dim=1)
+    weighted_umag = (umag * weights.view(1, -1)).sum(dim=1, keepdim=True)
+    weighted_node = torch.cat([weighted_abs_xyz, weighted_umag], dim=-1)
+
+    node_mean = weighted_node.mean(dim=0)
+    node_std = weighted_node.std(dim=0, unbiased=False)
+    node_max = weighted_node.max(dim=0).values
+
+    per_mode_umag_mean = umag.mean(dim=0)
+    per_mode_umag_rms = torch.sqrt(umag.pow(2).mean(dim=0).clamp_min(1e-12))
+    axis_energy = (abs_xyz * weights.view(1, -1, 1)).mean(dim=(0, 1))
+    axis_energy = axis_energy / axis_energy.sum().clamp_min(1e-12)
+
+    modal_frequencies = case.modal_frequencies.to(dtype=mode_shapes.dtype, device=mode_shapes.device)
+    nearest_features = torch.stack(
+        [
+            modal_frequencies[nearest_index],
+            log_gap[nearest_index],
+            weights[nearest_index],
+        ],
+        dim=0,
+    )
+
+    return torch.cat(
+        [
+            modal_frequencies,
+            weights,
+            log_gap,
+            per_mode_umag_mean,
+            per_mode_umag_rms,
+            node_mean,
+            node_std,
+            node_max,
+            axis_energy,
+            nearest_features,
+        ],
+        dim=0,
+    )
+
+
+def build_augmented_global_features(
+    case: Any,
+    use_psd: bool,
+    use_freq_top3: bool,
+    use_frequency_scalar: bool,
+    use_frequency_relations: bool,
+    feature_cfg: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    features = [
+        build_global_features(
+            case,
+            use_psd=use_psd,
+            use_freq_top3=use_freq_top3,
+            use_frequency_scalar=use_frequency_scalar,
+            use_frequency_relations=use_frequency_relations,
+        )
+    ]
+    mode_shape_global = build_mode_shape_global_features(case, feature_cfg=feature_cfg)
+    if mode_shape_global is not None:
+        features.append(mode_shape_global)
+    return torch.cat(features, dim=0)
+
+
 def build_augmented_node_features(
     case: Any,
     node_columns: list[str] | tuple[str, ...] | Any,
     feature_cfg: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     cfg = feature_cfg or {}
+    feature_parts = [case.node_features]
     if not bool(cfg.get("augment_high_reliability_features", cfg.get("augment_node_physics", False))):
-        return case.node_features
+        mode_shape_features = build_mode_shape_node_features(case, feature_cfg=cfg)
+        if mode_shape_features is not None:
+            feature_parts.append(mode_shape_features)
+        return torch.cat(feature_parts, dim=-1)
 
     x_index = _column_index(node_columns, "x")
     y_index = _column_index(node_columns, "y")
@@ -281,7 +479,11 @@ def build_augmented_node_features(
         center_couple_signed,
         near_center_couple,
     ]
-    return torch.cat([case.node_features] + physics_features, dim=-1)
+    feature_parts.extend(physics_features)
+    mode_shape_features = build_mode_shape_node_features(case, feature_cfg=cfg)
+    if mode_shape_features is not None:
+        feature_parts.append(mode_shape_features)
+    return torch.cat(feature_parts, dim=-1)
 
 
 def _stress_output_start(two_stage_rmises_cfg: dict[str, Any]) -> int:
@@ -351,12 +553,13 @@ def prepare_case(
 ) -> PreparedCase:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False, "threshold": 0.0}
     global_features = global_scaler.transform(
-        build_global_features(
+        build_augmented_global_features(
             case,
             use_psd=use_psd,
             use_freq_top3=use_freq_top3,
             use_frequency_scalar=use_frequency_scalar,
             use_frequency_relations=use_frequency_relations,
+            feature_cfg=feature_cfg,
         )
     )
     node_features = node_scaler.transform(
@@ -434,6 +637,7 @@ def fit_feature_scalers(
             target_freq_key=dataset_cfg["target_freq_key"],
             make_undirected=bool(dataset_cfg["make_undirected"]),
             cache_dir=cache_dir,
+            **get_mode_shape_loader_kwargs(feature_cfg),
         )
 
         node_stats.update(
@@ -445,12 +649,13 @@ def fit_feature_scalers(
         )
         edge_stats.update(case.edge_features)
         global_stats.update(
-            build_global_features(
+            build_augmented_global_features(
                 case,
                 use_psd=use_psd,
                 use_freq_top3=use_freq_top3,
                 use_frequency_scalar=use_frequency_scalar,
                 use_frequency_relations=use_frequency_relations,
+                feature_cfg=feature_cfg,
             )
         )
 
@@ -1140,6 +1345,7 @@ class Case7Trainer:
         self.use_freq_top3 = bool(self.feature_cfg.get("use_freq_top3", False))
         self.use_frequency_scalar = bool(self.feature_cfg.get("use_frequency_scalar", False))
         self.use_frequency_relations = bool(self.feature_cfg.get("use_frequency_relations", False))
+        self.use_mode_shapes = _requires_mode_shapes(self.feature_cfg)
         self.clamp_negative_rmises = bool(self.dataset_cfg.get("clamp_negative_rmises", True))
         self.cache_dir = self.dataset_cfg.get("cache_dir")
 
@@ -1167,6 +1373,7 @@ class Case7Trainer:
             target_freq_key=self.dataset_cfg["target_freq_key"],
             make_undirected=bool(self.dataset_cfg["make_undirected"]),
             cache_dir=self.cache_dir,
+            **get_mode_shape_loader_kwargs(self.feature_cfg),
         )
         return prepare_case(
             case,
@@ -1306,6 +1513,13 @@ class Case7Trainer:
         self.logger.info("Using freq_top3 features: %s", self.use_freq_top3)
         self.logger.info("Using scalar frequency feature: %s", self.use_frequency_scalar)
         self.logger.info("Using frequency relation features: %s", self.use_frequency_relations)
+        self.logger.info("Using mode shape features: %s", self.use_mode_shapes)
+        if self.use_mode_shapes:
+            self.logger.info("Mode shape loader config: %s", json.dumps(get_mode_shape_loader_kwargs(self.feature_cfg)))
+            self.logger.info(
+                "Mode shape global features: %s",
+                bool(self.feature_cfg.get("mode_shape_global_features", True)),
+            )
         self.logger.info(
             "High-reliability node feature augmentation: %s",
             bool(self.feature_cfg.get("augment_high_reliability_features", self.feature_cfg.get("augment_node_physics", False))),
