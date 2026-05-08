@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -22,6 +23,10 @@ PER_FREQUENCY_TARGET_COLUMN = "MISES_psd_density"
 FINAL_RMISES_FILENAME = "final_rmises.csv"
 FINAL_RMISES_COLUMN = "RMises_native"
 FRAME_FREQUENCY_PATTERN = re.compile(r"_(\d+(?:\.\d+)?)Hz$")
+MODE_SHAPES_DIRNAME = "mode_shapes"
+MODAL_FREQUENCIES_FILENAME = "modal_frequencies.csv"
+MODE_SHAPE_PATTERN = re.compile(r"mode_(\d+)_(\d+(?:\.\d+)?)Hz$", re.IGNORECASE)
+DEFAULT_MODE_SHAPE_COLUMNS = ("U1", "U2", "U3", "U_mag")
 
 
 @dataclass
@@ -35,6 +40,9 @@ class CaseGraph:
     freq_target: torch.Tensor
     frequency_scalar: torch.Tensor
     node_targets: torch.Tensor
+    modal_frequencies: torch.Tensor | None = None
+    mode_shapes: torch.Tensor | None = None
+    mode_shape_columns: tuple[str, ...] = DEFAULT_MODE_SHAPE_COLUMNS
 
     @property
     def num_nodes(self) -> int:
@@ -188,6 +196,143 @@ def _load_per_frequency_targets(target_path: Path, nodes_df: pd.DataFrame) -> to
         target_path=target_path,
     )
     return _stack_field_targets(mises_psd_density)
+
+
+def _parse_mode_shape_frequency(mode_path: Path) -> tuple[int, float]:
+    match = MODE_SHAPE_PATTERN.search(mode_path.stem)
+    if match is None:
+        raise ValueError(f"Could not parse modal index/frequency from mode shape file: {mode_path.name}")
+    return int(match.group(1)), float(match.group(2))
+
+
+def _discover_mode_shape_entries(case_dir: Path) -> list[tuple[int, float, Path]]:
+    modal_table_path = case_dir / MODAL_FREQUENCIES_FILENAME
+    entries: list[tuple[int, float, Path]] = []
+
+    if modal_table_path.exists():
+        modal_df = pd.read_csv(modal_table_path)
+        required_columns = {"mode_index", "frequency_hz", "file"}
+        if not required_columns.issubset(modal_df.columns):
+            missing = sorted(required_columns.difference(modal_df.columns))
+            raise KeyError(f"{modal_table_path} is missing columns: {missing}")
+        for row in modal_df.itertuples(index=False):
+            mode_file = case_dir / Path(str(getattr(row, "file")).replace("\\", "/"))
+            if not mode_file.exists():
+                raise FileNotFoundError(f"Mode shape file listed in {modal_table_path} does not exist: {mode_file}")
+            entries.append((int(getattr(row, "mode_index")), float(getattr(row, "frequency_hz")), mode_file))
+        return sorted(entries, key=lambda item: item[0])
+
+    mode_dir = case_dir / MODE_SHAPES_DIRNAME
+    if not mode_dir.exists():
+        raise FileNotFoundError(f"Mode shape directory does not exist: {mode_dir}")
+    for mode_path in sorted(mode_dir.glob("*.csv")):
+        mode_index, frequency_hz = _parse_mode_shape_frequency(mode_path)
+        entries.append((mode_index, frequency_hz, mode_path))
+    if not entries:
+        raise FileNotFoundError(f"No mode shape CSV files found in {mode_dir}")
+    return sorted(entries, key=lambda item: item[0])
+
+
+def _normalize_mode_shape_array(values: np.ndarray, columns: tuple[str, ...], normalization: str) -> np.ndarray:
+    if normalization == "none":
+        return values.astype(np.float32, copy=False)
+
+    if normalization != "max_umag":
+        raise ValueError(f"Unsupported mode shape normalization: {normalization}")
+
+    normalized = values.astype(np.float32, copy=True)
+    if "U_mag" in columns:
+        denom_source = np.abs(normalized[:, columns.index("U_mag")])
+    else:
+        denom_source = np.abs(normalized)
+    denom = float(np.nanmax(denom_source)) if denom_source.size else 0.0
+    if not np.isfinite(denom) or denom <= 0.0:
+        denom = 1.0
+    normalized /= np.float32(denom)
+    return normalized
+
+
+def _load_single_mode_shape(
+    mode_path: Path,
+    nodes_df: pd.DataFrame,
+    columns: tuple[str, ...],
+    normalization: str,
+) -> np.ndarray:
+    header = pd.read_csv(mode_path, nrows=0)
+    missing = [column for column in columns if column not in header.columns]
+    if missing:
+        raise KeyError(f"{mode_path} is missing requested mode shape columns: {missing}")
+
+    usecols = list(columns)
+    if "node_index" in header.columns:
+        usecols = ["node_index"] + usecols
+    mode_df = pd.read_csv(mode_path, usecols=usecols)
+
+    if "node_index" in nodes_df.columns and "node_index" in mode_df.columns:
+        merged = nodes_df[["node_index"]].merge(
+            mode_df[["node_index", *columns]],
+            on="node_index",
+            how="left",
+            sort=False,
+        )
+        if merged[list(columns)].isna().any().any():
+            missing_count = int(merged[list(columns)].isna().any(axis=1).sum())
+            raise ValueError(f"{mode_path} is missing {missing_count} nodes after aligning by node_index")
+        values = merged[list(columns)].to_numpy(dtype=np.float32)
+    else:
+        values = mode_df[list(columns)].to_numpy(dtype=np.float32)
+        if values.shape[0] != len(nodes_df):
+            raise ValueError(
+                f"{mode_path} row count {values.shape[0]} does not match nodes.csv row count {len(nodes_df)}"
+            )
+
+    return _normalize_mode_shape_array(values, columns=columns, normalization=normalization)
+
+
+@lru_cache(maxsize=64)
+def _load_mode_shapes_cached(
+    case_dir_str: str,
+    columns: tuple[str, ...],
+    mode_count_limit: int | None,
+    normalization: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    case_dir = Path(case_dir_str)
+    node_header = pd.read_csv(case_dir / "nodes.csv", nrows=0)
+    node_usecols = ["node_index"] if "node_index" in node_header.columns else None
+    nodes_df = pd.read_csv(case_dir / "nodes.csv", usecols=node_usecols)
+
+    entries = _discover_mode_shape_entries(case_dir)
+    if mode_count_limit is not None:
+        entries = entries[: int(mode_count_limit)]
+    if not entries:
+        raise FileNotFoundError(f"No mode shapes selected for {case_dir}")
+
+    frequencies = np.array([frequency_hz for _, frequency_hz, _ in entries], dtype=np.float32)
+    mode_arrays = [
+        _load_single_mode_shape(
+            mode_path=mode_path,
+            nodes_df=nodes_df,
+            columns=columns,
+            normalization=normalization,
+        )
+        for _, _, mode_path in entries
+    ]
+    mode_shapes = np.stack(mode_arrays, axis=1).astype(np.float32, copy=False)
+    return torch.tensor(frequencies, dtype=torch.float32), torch.tensor(mode_shapes, dtype=torch.float32)
+
+
+def _load_mode_shapes(
+    case_dir: Path,
+    columns: Sequence[str],
+    mode_count_limit: int | None,
+    normalization: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _load_mode_shapes_cached(
+        str(case_dir.resolve()),
+        tuple(str(column) for column in columns),
+        mode_count_limit,
+        normalization,
+    )
 
 
 def _resolve_case_and_target_path(sample_path: Path) -> tuple[Path, Path | None]:
@@ -483,9 +628,14 @@ def load_case_graph(
     target_freq_key: str = "freq_top3",
     make_undirected: bool = True,
     cache_dir: str | Path | None = None,
+    load_mode_shapes: bool = False,
+    mode_shape_columns: Sequence[str] = DEFAULT_MODE_SHAPE_COLUMNS,
+    mode_shape_count: int | None = None,
+    mode_shape_normalization: str = "max_umag",
 ) -> CaseGraph:
     sample_path = Path(case_dir)
     case_path, target_path = _resolve_case_and_target_path(sample_path)
+    mode_columns = tuple(str(column) for column in mode_shape_columns)
 
     if cache_dir is not None:
         cache_path = _cache_path_for_case(
@@ -497,7 +647,18 @@ def load_case_graph(
             make_undirected=make_undirected,
         )
         if cache_path.exists():
-            return _load_case_cache(cache_path)
+            cached_case = _load_case_cache(cache_path)
+            if load_mode_shapes:
+                modal_frequencies, mode_shapes = _load_mode_shapes(
+                    case_path,
+                    columns=mode_columns,
+                    mode_count_limit=mode_shape_count,
+                    normalization=mode_shape_normalization,
+                )
+                cached_case.modal_frequencies = modal_frequencies
+                cached_case.mode_shapes = mode_shapes
+                cached_case.mode_shape_columns = mode_columns
+            return cached_case
 
     global_payload = _load_global_payload(case_path)
     params, psd, freq_target = _load_global_json(global_payload, case_path, target_freq_key=target_freq_key)
@@ -514,6 +675,15 @@ def load_case_graph(
     )
     frequency_scalar = _load_frequency_scalar(target_path)
     sample_name = case_path.name if target_path is None else f"{case_path.name}/{target_path.name}"
+    modal_frequencies = None
+    mode_shapes = None
+    if load_mode_shapes:
+        modal_frequencies, mode_shapes = _load_mode_shapes(
+            case_path,
+            columns=mode_columns,
+            mode_count_limit=mode_shape_count,
+            normalization=mode_shape_normalization,
+        )
 
     case = CaseGraph(
         name=sample_name,
@@ -525,6 +695,9 @@ def load_case_graph(
         freq_target=freq_target,
         frequency_scalar=frequency_scalar,
         node_targets=node_targets,
+        modal_frequencies=modal_frequencies,
+        mode_shapes=mode_shapes,
+        mode_shape_columns=mode_columns,
     )
 
     if cache_dir is not None:
@@ -541,6 +714,10 @@ def load_selected_cases(
     target_freq_key: str = "freq_top3",
     make_undirected: bool = True,
     cache_dir: str | Path | None = None,
+    load_mode_shapes: bool = False,
+    mode_shape_columns: Sequence[str] = DEFAULT_MODE_SHAPE_COLUMNS,
+    mode_shape_count: int | None = None,
+    mode_shape_normalization: str = "max_umag",
 ) -> dict[str, CaseGraph]:
     selected_set = set(selected_names)
     available = discover_case_index(root)
@@ -558,6 +735,10 @@ def load_selected_cases(
             target_freq_key=target_freq_key,
             make_undirected=make_undirected,
             cache_dir=cache_dir,
+            load_mode_shapes=load_mode_shapes,
+            mode_shape_columns=mode_shape_columns,
+            mode_shape_count=mode_shape_count,
+            mode_shape_normalization=mode_shape_normalization,
         )
     return loaded
 

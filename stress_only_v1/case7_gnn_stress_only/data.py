@@ -234,7 +234,7 @@ def _discover_mode_shape_entries(case_dir: Path) -> list[tuple[int, float, Path]
             missing = sorted(required_columns.difference(modal_df.columns))
             raise KeyError(f"{modal_table_path} is missing columns: {missing}")
         for row in modal_df.itertuples(index=False):
-            mode_file = case_dir / Path(str(getattr(row, "file")))
+            mode_file = case_dir / Path(str(getattr(row, "file")).replace("\\", "/"))
             if not mode_file.exists():
                 raise FileNotFoundError(f"Mode shape file listed in {modal_table_path} does not exist: {mode_file}")
             entries.append((int(getattr(row, "mode_index")), float(getattr(row, "frequency_hz")), mode_file))
