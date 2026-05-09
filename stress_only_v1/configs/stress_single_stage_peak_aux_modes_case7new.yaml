@@ -32,9 +32,9 @@ features:
   mode_shape_weighting: resonance
   mode_shape_damping_ratio: 0.02
   mode_shape_modal_frequency_power: 2.0
-  mode_shape_global_features: true
-  mode_shape_include_nearest: true
-  mode_shape_include_frequency_context: true
+  mode_shape_global_features: false
+  mode_shape_include_nearest: false
+  mode_shape_include_frequency_context: false
   mode_shape_include_signed_weighted: false
   mode_shape_include_all_umag: false
 
@@ -60,7 +60,7 @@ training:
   print_every: 1
   early_stopping_patience: 6
   selection_metric: stress_hotspot_miss25_rate
-  save_dir: stress_only_v1/outputs/stress_single_stage_peak_aux_modes_case7new_topk5_peak1_boost8
+  save_dir: stress_only_v1/outputs/stress_single_stage_peak_aux_modes_minimal_case7new_topk5_peak1_boost8
 
 field_loss:
   stress_loss_weight: 1.0
