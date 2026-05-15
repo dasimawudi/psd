@@ -106,6 +106,7 @@ class EdgeMessagePassingLayer(nn.Module):
             if conditioning_state is None:
                 raise ValueError("conditioning_state is required when message conditioning is enabled.")
             messages = self.message_modulation(messages, conditioning_state)
+        messages = messages.to(dtype=node_state.dtype)
 
         aggregated = torch.zeros(num_nodes, self.hidden_dim, device=node_state.device, dtype=node_state.dtype)
         aggregated.index_add_(0, dst, messages)
@@ -121,6 +122,7 @@ class EdgeMessagePassingLayer(nn.Module):
             if conditioning_state is None:
                 raise ValueError("conditioning_state is required when update conditioning is enabled.")
             delta = self.update_modulation(delta, conditioning_state)
+        delta = delta.to(dtype=node_state.dtype)
         return self.norm(node_state + delta)
 
 
