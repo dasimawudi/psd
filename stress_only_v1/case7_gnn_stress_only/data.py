@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from uuid import uuid4
 
 import json
 import math
 import random
 import re
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -27,6 +29,45 @@ MODE_SHAPES_DIRNAME = "mode_shapes"
 MODAL_FREQUENCIES_FILENAME = "modal_frequencies.csv"
 MODE_SHAPE_PATTERN = re.compile(r"mode_(\d+)_(\d+(?:\.\d+)?)Hz$", re.IGNORECASE)
 DEFAULT_MODE_SHAPE_COLUMNS = ("U1", "U2", "U3", "U_mag")
+MODAL_TABLE_COLUMN_ALIASES = {
+    "mode_index": (
+        "mode_index",
+        "mode",
+        "mode_id",
+        "mode_no",
+        "mode_number",
+        "modal_index",
+        "modal_no",
+        "frame_index",
+        "eigenmode",
+    ),
+    "frequency_hz": (
+        "frequency_hz",
+        "freq_hz",
+        "frequency",
+        "frequency_hz.",
+        "frequency (hz)",
+        "frequency [hz]",
+        "freq",
+        "freq.",
+        "hz",
+        "eigenfrequency",
+        "eigenfrequency_hz",
+        "eigenfrequency (hz)",
+    ),
+    "file": (
+        "file",
+        "filename",
+        "file_name",
+        "path",
+        "relative_path",
+        "mode_file",
+        "mode_shape_file",
+        "csv",
+        "csv_file",
+    ),
+}
+NUMBER_PATTERN = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 
 DEFAULT_FIXED_GEOMETRY = {
     "plate_thickness": 15.0,
@@ -223,24 +264,68 @@ def _parse_mode_shape_frequency(mode_path: Path) -> tuple[int, float]:
     return int(match.group(1)), float(match.group(2))
 
 
-def _discover_mode_shape_entries(case_dir: Path) -> list[tuple[int, float, Path]]:
-    modal_table_path = case_dir / MODAL_FREQUENCIES_FILENAME
+def _canonical_modal_column(column: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(column).strip().lower())
+
+
+def _resolve_modal_table_columns(modal_df: pd.DataFrame) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for column in modal_df.columns:
+        canonical = _canonical_modal_column(column)
+        if canonical and canonical not in lookup:
+            lookup[canonical] = str(column)
+
+    resolved: dict[str, str] = {}
+    for expected_column, aliases in MODAL_TABLE_COLUMN_ALIASES.items():
+        for alias in aliases:
+            matched_column = lookup.get(_canonical_modal_column(alias))
+            if matched_column is not None:
+                resolved[expected_column] = matched_column
+                break
+    return resolved
+
+
+def _coerce_mode_index(value: object, modal_table_path: Path) -> int:
+    if pd.isna(value):
+        raise ValueError(f"{modal_table_path} contains an empty mode index")
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        match = NUMBER_PATTERN.search(str(value))
+        if match is not None:
+            return int(float(match.group(0)))
+    raise ValueError(f"{modal_table_path} contains an invalid mode index: {value!r}")
+
+
+def _coerce_frequency_hz(value: object, modal_table_path: Path) -> float:
+    if pd.isna(value):
+        raise ValueError(f"{modal_table_path} contains an empty modal frequency")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        match = NUMBER_PATTERN.search(str(value))
+        if match is not None:
+            return float(match.group(0))
+    raise ValueError(f"{modal_table_path} contains an invalid modal frequency: {value!r}")
+
+
+def _resolve_mode_shape_file(case_dir: Path, raw_file: object, modal_table_path: Path) -> Path:
+    if pd.isna(raw_file):
+        raise ValueError(f"{modal_table_path} contains an empty mode shape file path")
+    raw_path = Path(str(raw_file).strip().replace("\\", "/"))
+    candidates = [raw_path if raw_path.is_absolute() else case_dir / raw_path]
+    if raw_path.name:
+        candidates.append(case_dir / MODE_SHAPES_DIRNAME / raw_path.name)
+    for mode_file in candidates:
+        if mode_file.exists():
+            return mode_file
+    raise FileNotFoundError(f"Mode shape file listed in {modal_table_path} does not exist: {candidates[0]}")
+
+
+def _discover_mode_shape_entries_from_directory(case_dir: Path) -> list[tuple[int, float, Path]]:
+    mode_dir = case_dir / MODE_SHAPES_DIRNAME
     entries: list[tuple[int, float, Path]] = []
 
-    if modal_table_path.exists():
-        modal_df = pd.read_csv(modal_table_path)
-        required_columns = {"mode_index", "frequency_hz", "file"}
-        if not required_columns.issubset(modal_df.columns):
-            missing = sorted(required_columns.difference(modal_df.columns))
-            raise KeyError(f"{modal_table_path} is missing columns: {missing}")
-        for row in modal_df.itertuples(index=False):
-            mode_file = case_dir / Path(str(getattr(row, "file")).replace("\\", "/"))
-            if not mode_file.exists():
-                raise FileNotFoundError(f"Mode shape file listed in {modal_table_path} does not exist: {mode_file}")
-            entries.append((int(getattr(row, "mode_index")), float(getattr(row, "frequency_hz")), mode_file))
-        return sorted(entries, key=lambda item: item[0])
-
-    mode_dir = case_dir / MODE_SHAPES_DIRNAME
     if not mode_dir.exists():
         raise FileNotFoundError(f"Mode shape directory does not exist: {mode_dir}")
     for mode_path in sorted(mode_dir.glob("*.csv")):
@@ -249,6 +334,53 @@ def _discover_mode_shape_entries(case_dir: Path) -> list[tuple[int, float, Path]
     if not entries:
         raise FileNotFoundError(f"No mode shape CSV files found in {mode_dir}")
     return sorted(entries, key=lambda item: item[0])
+
+
+def _discover_mode_shape_entries_from_table(case_dir: Path, modal_table_path: Path) -> list[tuple[int, float, Path]]:
+    modal_df = pd.read_csv(modal_table_path)
+    resolved_columns = _resolve_modal_table_columns(modal_df)
+    missing = sorted({"mode_index", "frequency_hz", "file"}.difference(resolved_columns))
+
+    entries: list[tuple[int, float, Path]] = []
+    if "file" in resolved_columns:
+        file_column = resolved_columns["file"]
+        for _, row in modal_df.iterrows():
+            mode_file = _resolve_mode_shape_file(case_dir, row[file_column], modal_table_path)
+            if "mode_index" in resolved_columns and "frequency_hz" in resolved_columns:
+                mode_index = _coerce_mode_index(row[resolved_columns["mode_index"]], modal_table_path)
+                frequency_hz = _coerce_frequency_hz(row[resolved_columns["frequency_hz"]], modal_table_path)
+            else:
+                mode_index, frequency_hz = _parse_mode_shape_frequency(mode_file)
+            entries.append((mode_index, frequency_hz, mode_file))
+        return sorted(entries, key=lambda item: item[0])
+
+    if "mode_index" in resolved_columns and "frequency_hz" in resolved_columns:
+        directory_entries = _discover_mode_shape_entries_from_directory(case_dir)
+        files_by_mode_index = {mode_index: mode_file for mode_index, _, mode_file in directory_entries}
+        for position, row in modal_df.iterrows():
+            mode_index = _coerce_mode_index(row[resolved_columns["mode_index"]], modal_table_path)
+            frequency_hz = _coerce_frequency_hz(row[resolved_columns["frequency_hz"]], modal_table_path)
+            mode_file = files_by_mode_index.get(mode_index)
+            if mode_file is None and int(position) < len(directory_entries):
+                mode_file = directory_entries[int(position)][2]
+            if mode_file is None:
+                raise FileNotFoundError(f"Could not match mode {mode_index} in {modal_table_path} to a mode shape CSV")
+            entries.append((mode_index, frequency_hz, mode_file))
+        return sorted(entries, key=lambda item: item[0])
+
+    raise KeyError(f"{modal_table_path} is missing columns: {missing}")
+
+
+def _discover_mode_shape_entries(case_dir: Path) -> list[tuple[int, float, Path]]:
+    modal_table_path = case_dir / MODAL_FREQUENCIES_FILENAME
+    if modal_table_path.exists():
+        try:
+            return _discover_mode_shape_entries_from_table(case_dir, modal_table_path)
+        except KeyError:
+            if (case_dir / MODE_SHAPES_DIRNAME).exists():
+                return _discover_mode_shape_entries_from_directory(case_dir)
+            raise
+    return _discover_mode_shape_entries_from_directory(case_dir)
 
 
 def _normalize_mode_shape_array(values: np.ndarray, columns: tuple[str, ...], normalization: str) -> np.ndarray:
@@ -307,7 +439,7 @@ def _load_single_mode_shape(
     return _normalize_mode_shape_array(values, columns=columns, normalization=normalization)
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=512)
 def _load_mode_shapes_cached(
     case_dir_str: str,
     columns: tuple[str, ...],
@@ -477,23 +609,36 @@ def _cache_path_for_case(
     return Path(cache_dir) / signature / f"{_cache_sample_name(sample_path)}.pt"
 
 
+def _remove_cache_file(cache_path: Path) -> None:
+    try:
+        cache_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        warnings.warn(f"Could not remove invalid cache file {cache_path}: {exc}", RuntimeWarning, stacklevel=2)
+
+
 def _save_case_cache(cache_path: Path, case: CaseGraph) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "name": case.name,
-            "node_features": case.node_features,
-            "edge_index": case.edge_index,
-            "edge_features": case.edge_features,
-            "params": case.params,
-            "psd": case.psd,
-            "freq_target": case.freq_target,
-            "frequency_scalar": case.frequency_scalar,
-            "fixed_geometry": case.fixed_geometry,
-            "node_targets": case.node_targets,
-        },
-        cache_path,
-    )
+    payload = {
+        "name": case.name,
+        "node_features": case.node_features,
+        "edge_index": case.edge_index,
+        "edge_features": case.edge_features,
+        "params": case.params,
+        "psd": case.psd,
+        "freq_target": case.freq_target,
+        "frequency_scalar": case.frequency_scalar,
+        "fixed_geometry": case.fixed_geometry,
+        "node_targets": case.node_targets,
+    }
+    temp_path = cache_path.with_name(f".{cache_path.name}.{uuid4().hex}.tmp")
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, temp_path)
+        temp_path.replace(cache_path)
+    except Exception as exc:
+        _remove_cache_file(temp_path)
+        warnings.warn(f"Skipping case cache write for {cache_path}: {exc}", RuntimeWarning, stacklevel=2)
 
 
 def _load_case_cache(cache_path: Path) -> CaseGraph:
@@ -667,18 +812,27 @@ def load_case_graph(
             make_undirected=make_undirected,
         )
         if cache_path.exists():
-            cached_case = _load_case_cache(cache_path)
-            if load_mode_shapes:
-                modal_frequencies, mode_shapes = _load_mode_shapes(
-                    case_path,
-                    columns=mode_columns,
-                    mode_count_limit=mode_shape_count,
-                    normalization=mode_shape_normalization,
+            try:
+                cached_case = _load_case_cache(cache_path)
+            except Exception as exc:
+                warnings.warn(
+                    f"Ignoring invalid case cache {cache_path}; rebuilding from source CSVs: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
-                cached_case.modal_frequencies = modal_frequencies
-                cached_case.mode_shapes = mode_shapes
-                cached_case.mode_shape_columns = mode_columns
-            return cached_case
+                _remove_cache_file(cache_path)
+            else:
+                if load_mode_shapes:
+                    modal_frequencies, mode_shapes = _load_mode_shapes(
+                        case_path,
+                        columns=mode_columns,
+                        mode_count_limit=mode_shape_count,
+                        normalization=mode_shape_normalization,
+                    )
+                    cached_case.modal_frequencies = modal_frequencies
+                    cached_case.mode_shapes = mode_shapes
+                    cached_case.mode_shape_columns = mode_columns
+                return cached_case
 
     global_payload = _load_global_payload(case_path)
     params, psd, freq_target = _load_global_json(global_payload, case_path, target_freq_key=target_freq_key)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -110,6 +111,35 @@ def get_stress_peak_relative_cfg(config: dict[str, Any]) -> dict[str, Any]:
         "peak_loss_weight": float(raw_cfg.get("peak_loss_weight", 1.0)),
         "relative_loss_weight": float(raw_cfg.get("relative_loss_weight", 0.5)),
     }
+
+
+def get_amp_dtype(training_cfg: dict[str, Any]) -> torch.dtype | None:
+    raw_amp = training_cfg.get("amp", training_cfg.get("mixed_precision", False))
+    if isinstance(raw_amp, bool):
+        return torch.bfloat16 if raw_amp else None
+
+    amp_name = str(raw_amp).strip().lower()
+    if amp_name in {"", "0", "false", "none", "off", "no"}:
+        return None
+    if amp_name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if amp_name in {"fp16", "float16"}:
+        return torch.float16
+    raise ValueError(f"Unsupported training.amp value: {raw_amp!r}")
+
+
+def maybe_autocast(device: torch.device, amp_dtype: torch.dtype | None):
+    if amp_dtype is None or device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=amp_dtype)
+
+
+def enable_cuda_fast_math(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def _column_index(column_names: list[str] | tuple[str, ...] | Any, target_name: str) -> int | None:
@@ -1087,6 +1117,7 @@ def evaluate_field(
     collect_diagnostics: bool = False,
     diagnostic_split: str = "",
     diagnostic_epoch: int | None = None,
+    amp_dtype: torch.dtype | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], list[dict[str, Any]]]:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
     peak_relative_cfg = stress_peak_relative_cfg or {"enabled": False}
@@ -1113,12 +1144,13 @@ def evaluate_field(
     with torch.no_grad():
         for case_path in case_paths:
             batch = case_loader(case_path).to(device)
-            prediction = model(
-                batch.node_features,
-                batch.edge_index,
-                batch.edge_features,
-                batch.global_features,
-            )
+            with maybe_autocast(device, amp_dtype):
+                prediction = model(
+                    batch.node_features,
+                    batch.edge_index,
+                    batch.edge_features,
+                    batch.global_features,
+                )
             loss = compute_loss(
                 prediction,
                 batch.target_normalized,
@@ -1273,6 +1305,7 @@ def train_one_epoch(
     field_loss_cfg: dict[str, Any] | None = None,
     two_stage_rmises_cfg: dict[str, Any] | None = None,
     stress_peak_relative_cfg: dict[str, Any] | None = None,
+    amp_dtype: torch.dtype | None = None,
 ) -> float:
     model.train()
     shuffled = list(case_paths)
@@ -1284,23 +1317,24 @@ def train_one_epoch(
     for case_path in shuffled:
         batch = case_loader(case_path).to(device)
         optimizer.zero_grad(set_to_none=True)
-        prediction = model(
-            batch.node_features,
-            batch.edge_index,
-            batch.edge_features,
-            batch.global_features,
-        )
-        loss = compute_loss(
-            prediction,
-            batch.target_normalized,
-            loss_name=loss_name,
-            task=task,
-            target_metric=batch.target_metric if task == "field" else None,
-            batch=batch if task == "field" else None,
-            field_loss_cfg=field_loss_cfg,
-            two_stage_rmises_cfg=two_stage_rmises_cfg,
-            stress_peak_relative_cfg=stress_peak_relative_cfg,
-        )
+        with maybe_autocast(device, amp_dtype):
+            prediction = model(
+                batch.node_features,
+                batch.edge_index,
+                batch.edge_features,
+                batch.global_features,
+            )
+            loss = compute_loss(
+                prediction,
+                batch.target_normalized,
+                loss_name=loss_name,
+                task=task,
+                target_metric=batch.target_metric if task == "field" else None,
+                batch=batch if task == "field" else None,
+                field_loss_cfg=field_loss_cfg,
+                two_stage_rmises_cfg=two_stage_rmises_cfg,
+                stress_peak_relative_cfg=stress_peak_relative_cfg,
+            )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
@@ -1336,6 +1370,8 @@ class Case7Trainer:
         self.task = config["task"]
         self.dataset_cfg = config["dataset"]
         self.training_cfg = config["training"]
+        enable_cuda_fast_math(device)
+        self.amp_dtype = get_amp_dtype(self.training_cfg)
         self.field_loss_cfg = dict(config.get("field_loss", {}))
         self.two_stage_rmises_cfg = get_two_stage_rmises_cfg(config)
         self.stress_peak_relative_cfg = get_stress_peak_relative_cfg(config)
@@ -1481,6 +1517,7 @@ class Case7Trainer:
             collect_diagnostics=collect_diagnostics,
             diagnostic_split=diagnostic_split,
             diagnostic_epoch=diagnostic_epoch,
+            amp_dtype=self.amp_dtype,
         )
 
     def _append_history_row(self, row: dict[str, Any]) -> None:
@@ -1502,6 +1539,8 @@ class Case7Trainer:
 
         self.logger.info("Task: %s", self.task)
         self.logger.info("Device: %s", self.device)
+        self.logger.info("AMP: %s", str(self.amp_dtype).replace("torch.", "") if self.amp_dtype is not None else "disabled")
+        self.logger.info("CUDA TF32 fast math: %s", self.device.type == "cuda")
         self.logger.info("Validation selection metric: %s", self.training_cfg.get("selection_metric", "loss"))
         self.logger.info(
             "Train/Val/Test graphs: %s/%s/%s",
@@ -1570,6 +1609,7 @@ class Case7Trainer:
                 field_loss_cfg=self.field_loss_cfg,
                 two_stage_rmises_cfg=self.two_stage_rmises_cfg,
                 stress_peak_relative_cfg=self.stress_peak_relative_cfg,
+                amp_dtype=self.amp_dtype,
             )
 
             history_row = {
