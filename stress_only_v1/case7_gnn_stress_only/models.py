@@ -94,18 +94,32 @@ class EdgeMessagePassingLayer(nn.Module):
         edge_state: torch.Tensor,
         global_state: torch.Tensor,
         conditioning_state: torch.Tensor | None = None,
+        node_graph_index: torch.Tensor | None = None,
+        edge_graph_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         src, dst = edge_index
         num_nodes = node_state.size(0)
         num_edges = edge_index.size(1)
 
-        global_edges = global_state.unsqueeze(0).expand(num_edges, -1)
+        if global_state.dim() == 1:
+            global_edges = global_state.unsqueeze(0).expand(num_edges, -1)
+            global_nodes = global_state.unsqueeze(0).expand(num_nodes, -1)
+            conditioning_edges = conditioning_state
+            conditioning_nodes = conditioning_state
+        else:
+            if node_graph_index is None or edge_graph_index is None:
+                raise ValueError("Batched global_state requires node_graph_index and edge_graph_index.")
+            global_edges = global_state[edge_graph_index]
+            global_nodes = global_state[node_graph_index]
+            conditioning_edges = conditioning_state[edge_graph_index] if conditioning_state is not None else None
+            conditioning_nodes = conditioning_state[node_graph_index] if conditioning_state is not None else None
+
         message_input = torch.cat([node_state[src], edge_state, global_edges], dim=-1)
         messages = self.message_mlp(message_input)
         if self.message_modulation is not None:
-            if conditioning_state is None:
+            if conditioning_edges is None:
                 raise ValueError("conditioning_state is required when message conditioning is enabled.")
-            messages = self.message_modulation(messages, conditioning_state)
+            messages = self.message_modulation(messages, conditioning_edges)
         messages = messages.to(dtype=node_state.dtype)
 
         aggregated = torch.zeros(num_nodes, self.hidden_dim, device=node_state.device, dtype=node_state.dtype)
@@ -115,13 +129,12 @@ class EdgeMessagePassingLayer(nn.Module):
         degree.index_add_(0, dst, torch.ones(num_edges, 1, device=node_state.device, dtype=node_state.dtype))
         aggregated = aggregated / degree.clamp_min(1.0)
 
-        global_nodes = global_state.unsqueeze(0).expand(num_nodes, -1)
         update_input = torch.cat([node_state, aggregated, global_nodes], dim=-1)
         delta = self.update_mlp(update_input)
         if self.update_modulation is not None:
-            if conditioning_state is None:
+            if conditioning_nodes is None:
                 raise ValueError("conditioning_state is required when update conditioning is enabled.")
-            delta = self.update_modulation(delta, conditioning_state)
+            delta = self.update_modulation(delta, conditioning_nodes)
         delta = delta.to(dtype=node_state.dtype)
         return self.norm(node_state + delta)
 
@@ -200,23 +213,59 @@ class GraphEncoder(nn.Module):
         edge_index: torch.Tensor,
         edge_features: torch.Tensor,
         global_features: torch.Tensor,
+        node_graph_index: torch.Tensor | None = None,
+        edge_graph_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         node_state = self.node_encoder(node_features)
         edge_state = self.edge_encoder(edge_features)
         if self.enable_conditioning:
             assert self.case_encoder is not None
-            conditioning_state = self.case_encoder(global_features.unsqueeze(0)).squeeze(0)
-            global_state = self.global_encoder(conditioning_state.unsqueeze(0)).squeeze(0)
+            if global_features.dim() == 1:
+                conditioning_state = self.case_encoder(global_features.unsqueeze(0)).squeeze(0)
+                global_state = self.global_encoder(conditioning_state.unsqueeze(0)).squeeze(0)
+            else:
+                conditioning_state = self.case_encoder(global_features)
+                global_state = self.global_encoder(conditioning_state)
         else:
             conditioning_state = None
-            global_state = self.global_encoder(global_features.unsqueeze(0)).squeeze(0)
+            if global_features.dim() == 1:
+                global_state = self.global_encoder(global_features.unsqueeze(0)).squeeze(0)
+            else:
+                global_state = self.global_encoder(global_features)
 
         for layer in self.layers:
-            node_state = layer(node_state, edge_index, edge_state, global_state, conditioning_state)
+            node_state = layer(
+                node_state,
+                edge_index,
+                edge_state,
+                global_state,
+                conditioning_state,
+                node_graph_index=node_graph_index,
+                edge_graph_index=edge_graph_index,
+            )
 
-        pooled_mean = node_state.mean(dim=0)
-        pooled_max = node_state.max(dim=0).values
-        graph_state = torch.cat([pooled_mean, pooled_max, global_state], dim=-1)
+        if global_state.dim() == 1:
+            pooled_mean = node_state.mean(dim=0)
+            pooled_max = node_state.max(dim=0).values
+            graph_state = torch.cat([pooled_mean, pooled_max, global_state], dim=-1)
+        else:
+            if node_graph_index is None:
+                raise ValueError("Batched global_state requires node_graph_index.")
+            pooled_parts: list[torch.Tensor] = []
+            for graph_idx in range(global_state.size(0)):
+                mask = node_graph_index == graph_idx
+                graph_nodes = node_state[mask]
+                pooled_parts.append(
+                    torch.cat(
+                        [
+                            graph_nodes.mean(dim=0),
+                            graph_nodes.max(dim=0).values,
+                            global_state[graph_idx],
+                        ],
+                        dim=-1,
+                    )
+                )
+            graph_state = torch.stack(pooled_parts, dim=0)
         return node_state, edge_state, graph_state, global_state, conditioning_state
 
 
@@ -267,12 +316,16 @@ class FrequencyGNN(nn.Module):
         edge_index: torch.Tensor,
         edge_features: torch.Tensor,
         global_features: torch.Tensor,
+        node_graph_index: torch.Tensor | None = None,
+        edge_graph_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         _, _, graph_state, _, conditioning_state = self.encoder(
             node_features,
             edge_index,
             edge_features,
             global_features,
+            node_graph_index=node_graph_index,
+            edge_graph_index=edge_graph_index,
         )
         if self.graph_modulation is not None:
             assert conditioning_state is not None
@@ -407,32 +460,51 @@ class FieldGNN(nn.Module):
         edge_index: torch.Tensor,
         edge_features: torch.Tensor,
         global_features: torch.Tensor,
+        node_graph_index: torch.Tensor | None = None,
+        edge_graph_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         node_state, edge_state, graph_state, global_state, conditioning_state = self.encoder(
             node_features,
             edge_index,
             edge_features,
             global_features,
+            node_graph_index=node_graph_index,
+            edge_graph_index=edge_graph_index,
         )
-        global_nodes = global_state.unsqueeze(0).expand(node_state.size(0), -1)
+        if global_state.dim() == 1:
+            global_nodes = global_state.unsqueeze(0).expand(node_state.size(0), -1)
+            conditioning_nodes = conditioning_state
+        else:
+            if node_graph_index is None:
+                raise ValueError("Batched global_state requires node_graph_index.")
+            global_nodes = global_state[node_graph_index]
+            conditioning_nodes = conditioning_state[node_graph_index] if conditioning_state is not None else None
 
         rmises_state = node_state
         for layer in self.rmises_layers:
-            rmises_state = layer(rmises_state, edge_index, edge_state, global_state, conditioning_state)
+            rmises_state = layer(
+                rmises_state,
+                edge_index,
+                edge_state,
+                global_state,
+                conditioning_state,
+                node_graph_index=node_graph_index,
+                edge_graph_index=edge_graph_index,
+            )
 
         base_rmises_context = torch.cat([node_state, rmises_state, global_nodes], dim=-1)
         if self.use_two_stage_rmises:
             hotspot_input = base_rmises_context
             if self.hotspot_context_modulation is not None:
-                assert conditioning_state is not None
-                hotspot_input = self.hotspot_context_modulation(hotspot_input, conditioning_state)
+                assert conditioning_nodes is not None
+                hotspot_input = self.hotspot_context_modulation(hotspot_input, conditioning_nodes)
             assert self.hotspot_decoder is not None
             hotspot_logit = self.hotspot_decoder(hotspot_input)
 
             rmises_input = torch.cat([base_rmises_context, hotspot_logit], dim=-1)
             if self.rmises_context_modulation is not None:
-                assert conditioning_state is not None
-                rmises_input = self.rmises_context_modulation(rmises_input, conditioning_state)
+                assert conditioning_nodes is not None
+                rmises_input = self.rmises_context_modulation(rmises_input, conditioning_nodes)
             rmises_prediction = self.rmises_decoder(rmises_input)
             outputs = [hotspot_logit, rmises_prediction]
             if self.use_peak_relative_stress:
@@ -441,14 +513,19 @@ class FieldGNN(nn.Module):
                     assert conditioning_state is not None
                     peak_input = self.stress_peak_modulation(peak_input, conditioning_state)
                 assert self.stress_peak_decoder is not None
-                peak_prediction = self.stress_peak_decoder(peak_input.unsqueeze(0)).expand(node_state.size(0), -1)
+                if peak_input.dim() == 1:
+                    peak_prediction = self.stress_peak_decoder(peak_input.unsqueeze(0)).expand(node_state.size(0), -1)
+                else:
+                    if node_graph_index is None:
+                        raise ValueError("Batched peak prediction requires node_graph_index.")
+                    peak_prediction = self.stress_peak_decoder(peak_input)[node_graph_index]
                 outputs.append(peak_prediction)
             return torch.cat(outputs, dim=-1)
 
         rmises_input = base_rmises_context
         if self.rmises_context_modulation is not None:
-            assert conditioning_state is not None
-            rmises_input = self.rmises_context_modulation(rmises_input, conditioning_state)
+            assert conditioning_nodes is not None
+            rmises_input = self.rmises_context_modulation(rmises_input, conditioning_nodes)
         rmises_prediction = self.rmises_decoder(rmises_input)
         if not self.use_peak_relative_stress:
             return rmises_prediction
@@ -458,5 +535,10 @@ class FieldGNN(nn.Module):
             assert conditioning_state is not None
             peak_input = self.stress_peak_modulation(peak_input, conditioning_state)
         assert self.stress_peak_decoder is not None
-        peak_prediction = self.stress_peak_decoder(peak_input.unsqueeze(0)).expand(node_state.size(0), -1)
+        if peak_input.dim() == 1:
+            peak_prediction = self.stress_peak_decoder(peak_input.unsqueeze(0)).expand(node_state.size(0), -1)
+        else:
+            if node_graph_index is None:
+                raise ValueError("Batched peak prediction requires node_graph_index.")
+            peak_prediction = self.stress_peak_decoder(peak_input)[node_graph_index]
         return torch.cat([rmises_prediction, peak_prediction], dim=-1)

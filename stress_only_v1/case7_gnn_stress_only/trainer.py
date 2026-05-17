@@ -53,6 +53,9 @@ class PreparedCase:
     global_features: torch.Tensor
     target_normalized: torch.Tensor
     target_metric: torch.Tensor
+    node_graph_index: torch.Tensor | None = None
+    edge_graph_index: torch.Tensor | None = None
+    graph_count: int = 1
 
     def to(self, device: torch.device) -> "PreparedCase":
         return PreparedCase(
@@ -66,6 +69,9 @@ class PreparedCase:
             global_features=self.global_features.to(device),
             target_normalized=self.target_normalized.to(device),
             target_metric=self.target_metric.to(device),
+            node_graph_index=self.node_graph_index.to(device) if self.node_graph_index is not None else None,
+            edge_graph_index=self.edge_graph_index.to(device) if self.edge_graph_index is not None else None,
+            graph_count=self.graph_count,
         )
 
 
@@ -398,6 +404,85 @@ def build_mode_shape_global_features(case: Any, feature_cfg: dict[str, Any] | No
     )
 
 
+def collate_prepared_cases(cases: list[PreparedCase]) -> PreparedCase:
+    if not cases:
+        raise ValueError("Cannot collate an empty case batch.")
+    if len(cases) == 1:
+        return cases[0]
+
+    node_features: list[torch.Tensor] = []
+    edge_features: list[torch.Tensor] = []
+    edge_indices: list[torch.Tensor] = []
+    node_bc_masks: list[torch.Tensor] = []
+    edge_distances: list[torch.Tensor] = []
+    global_features: list[torch.Tensor] = []
+    target_normalized: list[torch.Tensor] = []
+    target_metric: list[torch.Tensor] = []
+    node_graph_index: list[torch.Tensor] = []
+    edge_graph_index: list[torch.Tensor] = []
+    node_offset = 0
+
+    for graph_idx, case in enumerate(cases):
+        num_nodes = int(case.node_features.size(0))
+        num_edges = int(case.edge_features.size(0))
+        node_features.append(case.node_features)
+        edge_features.append(case.edge_features)
+        edge_indices.append(case.edge_index + node_offset)
+        node_bc_masks.append(case.node_bc_mask)
+        edge_distances.append(case.edge_distance)
+        global_features.append(case.global_features)
+        target_normalized.append(case.target_normalized)
+        target_metric.append(case.target_metric)
+        node_graph_index.append(torch.full((num_nodes,), graph_idx, dtype=torch.long))
+        edge_graph_index.append(torch.full((num_edges,), graph_idx, dtype=torch.long))
+        node_offset += num_nodes
+
+    return PreparedCase(
+        name="+".join(case.name for case in cases),
+        frequency_hz=None,
+        node_features=torch.cat(node_features, dim=0),
+        edge_index=torch.cat(edge_indices, dim=1),
+        edge_features=torch.cat(edge_features, dim=0),
+        node_bc_mask=torch.cat(node_bc_masks, dim=0),
+        edge_distance=torch.cat(edge_distances, dim=0),
+        global_features=torch.stack(global_features, dim=0),
+        target_normalized=torch.cat(target_normalized, dim=0),
+        target_metric=torch.cat(target_metric, dim=0),
+        node_graph_index=torch.cat(node_graph_index, dim=0),
+        edge_graph_index=torch.cat(edge_graph_index, dim=0),
+        graph_count=len(cases),
+    )
+
+
+def _case_group_key(case_path: Path) -> str:
+    if case_path.parent.name == "per_frequency_mises":
+        return case_path.parent.parent.name
+    return case_path.name
+
+
+def make_training_batches(case_paths: list[Path], batch_size: int, same_case_only: bool) -> list[list[Path]]:
+    shuffled = list(case_paths)
+    random.shuffle(shuffled)
+    if batch_size <= 1:
+        return [[path] for path in shuffled]
+    if not same_case_only:
+        return [shuffled[idx : idx + batch_size] for idx in range(0, len(shuffled), batch_size)]
+
+    grouped: dict[str, list[Path]] = {}
+    for path in shuffled:
+        grouped.setdefault(_case_group_key(path), []).append(path)
+    group_keys = list(grouped)
+    random.shuffle(group_keys)
+
+    batches: list[list[Path]] = []
+    for key in group_keys:
+        paths = grouped[key]
+        random.shuffle(paths)
+        batches.extend(paths[idx : idx + batch_size] for idx in range(0, len(paths), batch_size))
+    random.shuffle(batches)
+    return batches
+
+
 def build_augmented_global_features(
     case: Any,
     use_psd: bool,
@@ -722,7 +807,7 @@ def build_model(config: dict[str, Any], sample_case: PreparedCase) -> torch.nn.M
     common_kwargs = dict(
         node_input_dim=int(sample_case.node_features.size(-1)),
         edge_input_dim=int(sample_case.edge_features.size(-1)),
-        global_input_dim=int(sample_case.global_features.numel()),
+        global_input_dim=int(sample_case.global_features.size(-1)),
         hidden_dim=int(model_cfg["hidden_dim"]),
         global_dim=int(model_cfg["global_dim"]),
         num_layers=int(model_cfg["num_layers"]),
@@ -918,16 +1003,37 @@ def compute_field_loss(
         else stress_peak_weight
     )
     if peak_loss_weight > 0.0 and stress_prediction.numel() > 0:
-        peak_prediction_for_loss = (
-            stress_peak_prediction[:1]
-            if bool(peak_relative_cfg["enabled"]) and stress_peak_prediction is not None
-            else stress_prediction.max().reshape(1)
-        )
-        peak_loss = compute_pointwise_loss(
-            peak_prediction_for_loss,
-            stress_target.max().reshape(1),
-            loss_name=loss_name,
-        ).mean() * peak_loss_weight
+        if batch is not None and batch.node_graph_index is not None:
+            peak_losses: list[torch.Tensor] = []
+            for graph_idx in range(batch.graph_count):
+                graph_mask = batch.node_graph_index == graph_idx
+                if not graph_mask.any():
+                    continue
+                peak_prediction_for_loss = (
+                    stress_peak_prediction[graph_mask][:1]
+                    if bool(peak_relative_cfg["enabled"]) and stress_peak_prediction is not None
+                    else stress_prediction[graph_mask].max().reshape(1)
+                )
+                peak_losses.append(
+                    compute_pointwise_loss(
+                        peak_prediction_for_loss,
+                        stress_target[graph_mask].max().reshape(1),
+                        loss_name=loss_name,
+                    ).mean()
+                )
+            if peak_losses:
+                peak_loss = torch.stack(peak_losses).mean() * peak_loss_weight
+        else:
+            peak_prediction_for_loss = (
+                stress_peak_prediction[:1]
+                if bool(peak_relative_cfg["enabled"]) and stress_peak_prediction is not None
+                else stress_prediction.max().reshape(1)
+            )
+            peak_loss = compute_pointwise_loss(
+                peak_prediction_for_loss,
+                stress_target.max().reshape(1),
+                loss_name=loss_name,
+            ).mean() * peak_loss_weight
 
     relative_loss = stress_loss.new_zeros(())
     if bool(peak_relative_cfg["enabled"]) and stress_relative_drop is not None:
@@ -1150,6 +1256,8 @@ def evaluate_field(
                     batch.edge_index,
                     batch.edge_features,
                     batch.global_features,
+                    node_graph_index=batch.node_graph_index,
+                    edge_graph_index=batch.edge_graph_index,
                 )
             loss = compute_loss(
                 prediction,
@@ -1306,16 +1414,21 @@ def train_one_epoch(
     two_stage_rmises_cfg: dict[str, Any] | None = None,
     stress_peak_relative_cfg: dict[str, Any] | None = None,
     amp_dtype: torch.dtype | None = None,
+    batch_size: int = 1,
+    batch_same_case_only: bool = True,
 ) -> float:
     model.train()
-    shuffled = list(case_paths)
-    random.shuffle(shuffled)
+    path_batches = make_training_batches(
+        case_paths,
+        batch_size=max(1, int(batch_size)),
+        same_case_only=batch_same_case_only,
+    )
 
     total_loss = 0.0
     total_weight = 0
 
-    for case_path in shuffled:
-        batch = case_loader(case_path).to(device)
+    for path_batch in path_batches:
+        batch = collate_prepared_cases([case_loader(case_path) for case_path in path_batch]).to(device)
         optimizer.zero_grad(set_to_none=True)
         with maybe_autocast(device, amp_dtype):
             prediction = model(
@@ -1323,6 +1436,8 @@ def train_one_epoch(
                 batch.edge_index,
                 batch.edge_features,
                 batch.global_features,
+                node_graph_index=batch.node_graph_index,
+                edge_graph_index=batch.edge_graph_index,
             )
             loss = compute_loss(
                 prediction,
@@ -1589,6 +1704,10 @@ class Case7Trainer:
             self.logger.info("Raw case cache: %s", self.cache_dir)
         if self.dataset_cfg.get("scaler_fit_case_limit") is not None:
             self.logger.info("Scaler fit case limit: %s", self.dataset_cfg["scaler_fit_case_limit"])
+        batch_size = int(self.training_cfg.get("batch_size", 1))
+        batch_same_case_only = bool(self.training_cfg.get("batch_same_case_only", True))
+        self.logger.info("Training graph batch size: %s", batch_size)
+        self.logger.info("Batch same case only: %s", batch_same_case_only)
 
         selection_metric = str(self.training_cfg.get("selection_metric", "loss"))
         best_val_score = float("inf")
@@ -1610,6 +1729,8 @@ class Case7Trainer:
                 two_stage_rmises_cfg=self.two_stage_rmises_cfg,
                 stress_peak_relative_cfg=self.stress_peak_relative_cfg,
                 amp_dtype=self.amp_dtype,
+                batch_size=batch_size,
+                batch_same_case_only=batch_same_case_only,
             )
 
             history_row = {
