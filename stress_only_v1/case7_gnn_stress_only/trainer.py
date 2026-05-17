@@ -9,6 +9,7 @@ import csv
 import json
 import math
 import random
+import time
 
 import torch
 import torch.nn.functional as F
@@ -481,6 +482,17 @@ def make_training_batches(case_paths: list[Path], batch_size: int, same_case_onl
         batches.extend(paths[idx : idx + batch_size] for idx in range(0, len(paths), batch_size))
     random.shuffle(batches)
     return batches
+
+
+def _format_duration(seconds: float) -> str:
+    seconds_int = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds_int, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def build_augmented_global_features(
@@ -1416,6 +1428,9 @@ def train_one_epoch(
     amp_dtype: torch.dtype | None = None,
     batch_size: int = 1,
     batch_same_case_only: bool = True,
+    logger: Any | None = None,
+    epoch: int | None = None,
+    progress_every_steps: int = 100,
 ) -> float:
     model.train()
     path_batches = make_training_batches(
@@ -1423,11 +1438,22 @@ def train_one_epoch(
         batch_size=max(1, int(batch_size)),
         same_case_only=batch_same_case_only,
     )
+    total_batches = len(path_batches)
+    started_at = time.monotonic()
+    epoch_label = f"{epoch:04d}" if epoch is not None else "????"
+    if logger is not None:
+        logger.info(
+            "Epoch %s train start | batches=%s | graphs=%s | batch_size=%s",
+            epoch_label,
+            total_batches,
+            len(case_paths),
+            max(1, int(batch_size)),
+        )
 
     total_loss = 0.0
     total_weight = 0
 
-    for path_batch in path_batches:
+    for step, path_batch in enumerate(path_batches, start=1):
         batch = collate_prepared_cases([case_loader(case_path) for case_path in path_batch]).to(device)
         optimizer.zero_grad(set_to_none=True)
         with maybe_autocast(device, amp_dtype):
@@ -1457,6 +1483,24 @@ def train_one_epoch(
         weight = int(batch.node_features.size(0)) if batch.target_normalized.dim() == 2 else 1
         total_loss += loss.item() * weight
         total_weight += weight
+
+        if logger is not None and (
+            step == 1
+            or step == total_batches
+            or (progress_every_steps > 0 and step % progress_every_steps == 0)
+        ):
+            elapsed = time.monotonic() - started_at
+            eta = elapsed / max(step, 1) * max(total_batches - step, 0)
+            logger.info(
+                "Epoch %s progress | step=%s/%s | %.1f%% | elapsed=%s | eta=%s | running_loss=%.6f",
+                epoch_label,
+                step,
+                total_batches,
+                100.0 * step / max(total_batches, 1),
+                _format_duration(elapsed),
+                _format_duration(eta),
+                total_loss / max(total_weight, 1),
+            )
 
     return total_loss / max(total_weight, 1)
 
@@ -1706,8 +1750,10 @@ class Case7Trainer:
             self.logger.info("Scaler fit case limit: %s", self.dataset_cfg["scaler_fit_case_limit"])
         batch_size = int(self.training_cfg.get("batch_size", 1))
         batch_same_case_only = bool(self.training_cfg.get("batch_same_case_only", True))
+        progress_every_steps = int(self.training_cfg.get("progress_every_steps", 100))
         self.logger.info("Training graph batch size: %s", batch_size)
         self.logger.info("Batch same case only: %s", batch_same_case_only)
+        self.logger.info("Training progress log every steps: %s", progress_every_steps)
 
         selection_metric = str(self.training_cfg.get("selection_metric", "loss"))
         best_val_score = float("inf")
@@ -1739,6 +1785,9 @@ class Case7Trainer:
                 amp_dtype=self.amp_dtype,
                 batch_size=batch_size,
                 batch_same_case_only=batch_same_case_only,
+                logger=self.logger,
+                epoch=epoch,
+                progress_every_steps=progress_every_steps,
             )
 
             history_row = {
