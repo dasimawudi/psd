@@ -61,6 +61,7 @@ def _prepare_case(
         target_freq_key=dataset_cfg["target_freq_key"],
         make_undirected=bool(dataset_cfg["make_undirected"]),
         cache_dir=dataset_cfg.get("cache_dir"),
+        node_region=dataset_cfg.get("node_region"),
         **get_mode_shape_loader_kwargs(feature_cfg),
     )
     prepared = prepare_case(

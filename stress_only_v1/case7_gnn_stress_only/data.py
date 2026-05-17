@@ -95,6 +95,7 @@ class CaseGraph:
     modal_frequencies: torch.Tensor | None = None
     mode_shapes: torch.Tensor | None = None
     mode_shape_columns: tuple[str, ...] = DEFAULT_MODE_SHAPE_COLUMNS
+    source_node_indices: torch.Tensor | None = None
 
     @property
     def num_nodes(self) -> int:
@@ -565,6 +566,120 @@ def _load_edges(case_dir: Path, edge_columns: Sequence[str], make_undirected: bo
     return edge_index, edge_features
 
 
+def _canonical_node_region_cfg(node_region: dict[str, Any] | str | None) -> dict[str, Any]:
+    if node_region is None:
+        return {"type": "all"}
+    if isinstance(node_region, str):
+        return {"type": node_region}
+    if not bool(node_region.get("enabled", True)):
+        return {"type": "all"}
+    return dict(node_region)
+
+
+def _node_region_cache_part(node_region: dict[str, Any] | str | None) -> str:
+    cfg = _canonical_node_region_cfg(node_region)
+    if str(cfg.get("type", "all")).lower() in {"", "all", "none"}:
+        return "all"
+    payload = json.dumps(cfg, sort_keys=True, separators=(",", ":"))
+    return _sanitize_cache_part(payload)
+
+
+def _build_earpiece_region_mask(
+    nodes_df: pd.DataFrame,
+    global_payload: dict[str, Any],
+    cfg: dict[str, Any],
+) -> np.ndarray:
+    fixed_geometry = global_payload.get("fixed_geometry", {})
+    earpiece_count = max(1, int(float(fixed_geometry.get("earpiece_Count_default", 3))))
+    earpiece_hole_radius = float(fixed_geometry.get("earpiece_HoleRadius", 4.0))
+
+    earpiece_radial_dist = _extract_param_value(global_payload, "earpiece_RadialDist", fallback_index=1)
+    earpiece_top_width = _extract_param_value(global_payload, "earpiece_TopWidth", fallback_index=2)
+    earpiece_hole_top_dist = _extract_param_value(global_payload, "earpiece_HoleTopDist", fallback_index=3)
+    earpiece_top_fillet = _extract_param_value(global_payload, "earpiece_TopFilletRadius", fallback_index=4) or 0.0
+    earpiece_bottom_fillet = _extract_param_value(global_payload, "earpiece_BottomFilletRadius", fallback_index=5) or 0.0
+    plate_radius = _extract_param_value(global_payload, "plate_radius", fallback_index=6)
+
+    required = {
+        "earpiece_RadialDist": earpiece_radial_dist,
+        "earpiece_TopWidth": earpiece_top_width,
+        "earpiece_HoleTopDist": earpiece_hole_top_dist,
+        "plate_radius": plate_radius,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(f"Cannot build earpiece node region; global.json is missing {missing}")
+
+    root_margin = float(cfg.get("root_margin", max(earpiece_hole_radius, earpiece_bottom_fillet, 4.0)))
+    top_margin = float(cfg.get("top_margin", max(earpiece_hole_radius, earpiece_top_fillet, 4.0)))
+    width_margin = float(cfg.get("width_margin", earpiece_hole_radius))
+    width_scale = float(cfg.get("width_scale", 1.5))
+    radial_min = float(cfg.get("radial_min", float(plate_radius) - root_margin))
+    axial_min = float(cfg.get("axial_min", float(plate_radius) - root_margin))
+    axial_max = float(cfg.get("axial_max", float(earpiece_radial_dist) + float(earpiece_hole_top_dist) + top_margin))
+    half_width = float(cfg.get("half_width", 0.5 * float(earpiece_top_width) * width_scale + width_margin))
+
+    xy = nodes_df[["x", "y"]].to_numpy(dtype=np.float32)
+    radius = np.sqrt(np.sum(np.square(xy), axis=1))
+    angles = np.linspace(0.0, 2.0 * math.pi, num=earpiece_count, endpoint=False, dtype=np.float32)
+    axial_axes = np.stack([-np.sin(angles), np.cos(angles)], axis=1).astype(np.float32, copy=False)
+    tangent_axes = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32, copy=False)
+
+    axial = xy @ axial_axes.T
+    transverse = np.abs(xy @ tangent_axes.T)
+    in_corridor = (axial >= axial_min) & (axial <= axial_max) & (transverse <= half_width)
+    return ((radius >= radial_min) & in_corridor.any(axis=1)).astype(bool, copy=False)
+
+
+def _build_node_region_indices(
+    case_dir: Path,
+    global_payload: dict[str, Any],
+    node_region: dict[str, Any] | str | None,
+) -> torch.Tensor | None:
+    cfg = _canonical_node_region_cfg(node_region)
+    region_type = str(cfg.get("type", "all")).lower()
+    if region_type in {"", "all", "none"}:
+        return None
+    if region_type not in {"earpiece", "earpiece_region"}:
+        raise ValueError(f"Unsupported dataset.node_region.type: {region_type}")
+
+    nodes_df = pd.read_csv(case_dir / "nodes.csv", usecols=["x", "y"])
+    mask = _build_earpiece_region_mask(nodes_df, global_payload=global_payload, cfg=cfg)
+    if not mask.any():
+        raise ValueError(f"Node region '{region_type}' selected zero nodes for {case_dir}")
+    return torch.tensor(np.flatnonzero(mask), dtype=torch.long)
+
+
+def _filter_graph_to_node_indices(
+    node_features: torch.Tensor,
+    node_targets: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_features: torch.Tensor,
+    node_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if node_indices is None:
+        return node_features, node_targets, edge_index, edge_features
+
+    node_indices = node_indices.to(dtype=torch.long)
+    original_node_count = int(node_features.size(0))
+    keep_nodes = torch.zeros(original_node_count, dtype=torch.bool)
+    keep_nodes[node_indices] = True
+
+    src, dst = edge_index
+    keep_edges = keep_nodes[src] & keep_nodes[dst]
+    if not bool(keep_edges.any()):
+        raise ValueError("Node region filtering removed all edges; widen the region margins.")
+
+    old_to_new = torch.full((original_node_count,), -1, dtype=torch.long)
+    old_to_new[node_indices] = torch.arange(node_indices.numel(), dtype=torch.long)
+    return (
+        node_features[node_indices],
+        node_targets[node_indices],
+        old_to_new[edge_index[:, keep_edges]],
+        edge_features[keep_edges],
+    )
+
+
 def _sanitize_cache_part(value: str) -> str:
     sanitized = "".join(ch if ch.isalnum() else "-" for ch in value)
     sanitized = sanitized.strip("-")
@@ -576,12 +691,15 @@ def _cache_signature(
     edge_columns: Sequence[str],
     target_freq_key: str,
     make_undirected: bool,
+    node_region: dict[str, Any] | str | None = None,
 ) -> str:
     node_part = "_".join(_sanitize_cache_part(column) for column in node_columns)
     edge_part = "_".join(_sanitize_cache_part(column) for column in edge_columns)
     freq_part = _sanitize_cache_part(target_freq_key)
     undir_part = "1" if make_undirected else "0"
-    return f"nodes-{node_part}__edges-{edge_part}__freq-{freq_part}__undir-{undir_part}"
+    region_part = _node_region_cache_part(node_region)
+    base = f"nodes-{node_part}__edges-{edge_part}__freq-{freq_part}__undir-{undir_part}"
+    return base if region_part == "all" else f"{base}__region-{region_part}"
 
 
 def _cache_sample_name(sample_path: Path) -> str:
@@ -599,12 +717,14 @@ def _cache_path_for_case(
     edge_columns: Sequence[str],
     target_freq_key: str,
     make_undirected: bool,
+    node_region: dict[str, Any] | str | None = None,
 ) -> Path:
     signature = _cache_signature(
         node_columns=node_columns,
         edge_columns=edge_columns,
         target_freq_key=target_freq_key,
         make_undirected=make_undirected,
+        node_region=node_region,
     )
     return Path(cache_dir) / signature / f"{_cache_sample_name(sample_path)}.pt"
 
@@ -630,6 +750,7 @@ def _save_case_cache(cache_path: Path, case: CaseGraph) -> None:
         "frequency_scalar": case.frequency_scalar,
         "fixed_geometry": case.fixed_geometry,
         "node_targets": case.node_targets,
+        "source_node_indices": case.source_node_indices,
     }
     temp_path = cache_path.with_name(f".{cache_path.name}.{uuid4().hex}.tmp")
     try:
@@ -654,6 +775,7 @@ def _load_case_cache(cache_path: Path) -> CaseGraph:
         frequency_scalar=payload.get("frequency_scalar", torch.empty(0, dtype=torch.float32)),
         fixed_geometry=payload.get("fixed_geometry", dict(DEFAULT_FIXED_GEOMETRY)),
         node_targets=payload["node_targets"],
+        source_node_indices=payload.get("source_node_indices"),
     )
 
 
@@ -797,6 +919,7 @@ def load_case_graph(
     mode_shape_columns: Sequence[str] = DEFAULT_MODE_SHAPE_COLUMNS,
     mode_shape_count: int | None = None,
     mode_shape_normalization: str = "max_umag",
+    node_region: dict[str, Any] | str | None = None,
 ) -> CaseGraph:
     sample_path = Path(case_dir)
     case_path, target_path = _resolve_case_and_target_path(sample_path)
@@ -810,6 +933,7 @@ def load_case_graph(
             edge_columns=edge_columns,
             target_freq_key=target_freq_key,
             make_undirected=make_undirected,
+            node_region=node_region,
         )
         if cache_path.exists():
             try:
@@ -829,6 +953,8 @@ def load_case_graph(
                         mode_count_limit=mode_shape_count,
                         normalization=mode_shape_normalization,
                     )
+                    if cached_case.source_node_indices is not None:
+                        mode_shapes = mode_shapes[cached_case.source_node_indices]
                     cached_case.modal_frequencies = modal_frequencies
                     cached_case.mode_shapes = mode_shapes
                     cached_case.mode_shape_columns = mode_columns
@@ -848,6 +974,18 @@ def load_case_graph(
         edge_columns=edge_columns,
         make_undirected=make_undirected,
     )
+    source_node_indices = _build_node_region_indices(
+        case_path,
+        global_payload=global_payload,
+        node_region=node_region,
+    )
+    node_features, node_targets, edge_index, edge_features = _filter_graph_to_node_indices(
+        node_features,
+        node_targets,
+        edge_index,
+        edge_features,
+        source_node_indices,
+    )
     frequency_scalar = _load_frequency_scalar(target_path)
     sample_name = case_path.name if target_path is None else f"{case_path.name}/{target_path.name}"
     modal_frequencies = None
@@ -859,6 +997,8 @@ def load_case_graph(
             mode_count_limit=mode_shape_count,
             normalization=mode_shape_normalization,
         )
+        if source_node_indices is not None:
+            mode_shapes = mode_shapes[source_node_indices]
 
     case = CaseGraph(
         name=sample_name,
@@ -874,6 +1014,7 @@ def load_case_graph(
         modal_frequencies=modal_frequencies,
         mode_shapes=mode_shapes,
         mode_shape_columns=mode_columns,
+        source_node_indices=source_node_indices,
     )
 
     if cache_dir is not None:
@@ -894,6 +1035,7 @@ def load_selected_cases(
     mode_shape_columns: Sequence[str] = DEFAULT_MODE_SHAPE_COLUMNS,
     mode_shape_count: int | None = None,
     mode_shape_normalization: str = "max_umag",
+    node_region: dict[str, Any] | str | None = None,
 ) -> dict[str, CaseGraph]:
     selected_set = set(selected_names)
     available = discover_case_index(root)
@@ -915,6 +1057,7 @@ def load_selected_cases(
             mode_shape_columns=mode_shape_columns,
             mode_shape_count=mode_shape_count,
             mode_shape_normalization=mode_shape_normalization,
+            node_region=node_region,
         )
     return loaded
 

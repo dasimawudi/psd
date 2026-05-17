@@ -764,6 +764,7 @@ def fit_feature_scalers(
             target_freq_key=dataset_cfg["target_freq_key"],
             make_undirected=bool(dataset_cfg["make_undirected"]),
             cache_dir=cache_dir,
+            node_region=dataset_cfg.get("node_region"),
             **get_mode_shape_loader_kwargs(feature_cfg),
         )
 
@@ -1188,6 +1189,7 @@ FIELD_DIAGNOSTIC_FIELDNAMES = [
     "node_count",
     "loss",
     "stress_mae",
+    "stress_log_mae",
     "target_peak",
     "pred_peak",
     "peak_relative_error",
@@ -1195,6 +1197,7 @@ FIELD_DIAGNOSTIC_FIELDNAMES = [
     "target_hotspot_nodes",
     "pred_hotspot_nodes",
     "hotspot_mae",
+    "hotspot_log_mae",
     "hotspot_within25_count",
     "hotspot_within25_ratio",
     "hotspot_precision",
@@ -1205,6 +1208,7 @@ FIELD_DIAGNOSTIC_FIELDNAMES = [
     "hotspot_fn",
     "non_hotspot_nodes",
     "non_hotspot_mae",
+    "non_hotspot_log_mae",
     "non_hotspot_within25_count",
     "non_hotspot_within25_ratio",
     "non_hotspot_target_mean",
@@ -1251,21 +1255,27 @@ def evaluate_field(
     total_loss = 0.0
     total_nodes = 0
     total_stress_abs = 0.0
+    total_stress_log_abs = 0.0
+    total_stress_log_sq = 0.0
     total_hotspot_tp = 0.0
     total_hotspot_fp = 0.0
     total_hotspot_fn = 0.0
     total_hotspot_abs = 0.0
+    total_hotspot_log_abs = 0.0
     total_hotspot_nodes = 0
     total_hotspot_within_tolerance = 0
     total_non_hotspot_abs = 0.0
+    total_non_hotspot_log_abs = 0.0
     total_non_hotspot_target = 0.0
     total_non_hotspot_pred = 0.0
     total_non_hotspot_bias = 0.0
     total_non_hotspot_nodes = 0
     total_non_hotspot_within_tolerance = 0
     total_top1_abs = 0.0
+    total_top1_log_abs = 0.0
     total_top1_nodes = 0
     total_top5_abs = 0.0
+    total_top5_log_abs = 0.0
     total_top5_nodes = 0
     total_peak_relative_error = 0.0
     total_cases = 0
@@ -1312,7 +1322,12 @@ def evaluate_field(
             stress_target = target_raw[:, 0].clamp_min(0.0)
             stress_prediction = prediction_raw[:, 0].clamp_min(0.0)
             stress_error = error[:, 0]
+            stress_log_target = torch.log1p(stress_target)
+            stress_log_prediction = torch.log1p(stress_prediction)
+            stress_log_error = (stress_log_prediction - stress_log_target).abs()
             total_stress_abs += stress_error.sum().item()
+            total_stress_log_abs += stress_log_error.sum().item()
+            total_stress_log_sq += stress_log_error.pow(2).sum().item()
             total_cases += 1
 
             target_peak = 0.0
@@ -1327,21 +1342,26 @@ def evaluate_field(
                 top1_threshold = torch.quantile(stress_target, 0.99)
                 top1_mask = stress_target >= top1_threshold
                 total_top1_abs += stress_error[top1_mask].sum().item()
+                total_top1_log_abs += stress_log_error[top1_mask].sum().item()
                 total_top1_nodes += int(top1_mask.sum().item())
 
                 top5_threshold = torch.quantile(stress_target, 0.95)
                 top5_mask = stress_target >= top5_threshold
                 total_top5_abs += stress_error[top5_mask].sum().item()
+                total_top5_log_abs += stress_log_error[top5_mask].sum().item()
                 total_top5_nodes += int(top5_mask.sum().item())
 
             hotspot_threshold = compute_stress_hotspot_threshold(stress_target, metric_hotspot_cfg)
             target_hotspot = build_rmises_hotspot_targets(stress_target, threshold=hotspot_threshold).to(dtype=torch.bool)
             sample_hotspot_abs = 0.0
+            sample_hotspot_log_abs = 0.0
             sample_hotspot_within_tolerance = 0
             sample_hotspot_nodes = int(target_hotspot.sum().item())
             if target_hotspot.any():
                 sample_hotspot_abs = stress_error[target_hotspot].sum().item()
+                sample_hotspot_log_abs = stress_log_error[target_hotspot].sum().item()
                 total_hotspot_abs += sample_hotspot_abs
+                total_hotspot_log_abs += sample_hotspot_log_abs
                 total_hotspot_nodes += sample_hotspot_nodes
                 hotspot_relative_error = stress_error[target_hotspot] / stress_target[target_hotspot].abs().clamp_min(1e-12)
                 sample_hotspot_within_tolerance = int(
@@ -1351,6 +1371,7 @@ def evaluate_field(
 
             non_hotspot_mask = ~target_hotspot
             sample_non_hotspot_abs = 0.0
+            sample_non_hotspot_log_abs = 0.0
             sample_non_hotspot_target = 0.0
             sample_non_hotspot_pred = 0.0
             sample_non_hotspot_bias = 0.0
@@ -1358,6 +1379,7 @@ def evaluate_field(
             sample_non_hotspot_nodes = int(non_hotspot_mask.sum().item())
             if non_hotspot_mask.any():
                 sample_non_hotspot_abs = stress_error[non_hotspot_mask].sum().item()
+                sample_non_hotspot_log_abs = stress_log_error[non_hotspot_mask].sum().item()
                 sample_non_hotspot_target = stress_target[non_hotspot_mask].sum().item()
                 sample_non_hotspot_pred = stress_prediction[non_hotspot_mask].sum().item()
                 sample_non_hotspot_bias = (stress_prediction[non_hotspot_mask] - stress_target[non_hotspot_mask]).sum().item()
@@ -1366,6 +1388,7 @@ def evaluate_field(
                     (non_hotspot_relative_error <= float(metric_hotspot_cfg["within_relative_error"])).sum().item()
                 )
                 total_non_hotspot_abs += sample_non_hotspot_abs
+                total_non_hotspot_log_abs += sample_non_hotspot_log_abs
                 total_non_hotspot_target += sample_non_hotspot_target
                 total_non_hotspot_pred += sample_non_hotspot_pred
                 total_non_hotspot_bias += sample_non_hotspot_bias
@@ -1408,6 +1431,7 @@ def evaluate_field(
                         "node_count": node_count,
                         "loss": loss.item(),
                         "stress_mae": stress_error.mean().item(),
+                        "stress_log_mae": stress_log_error.mean().item(),
                         "target_peak": target_peak,
                         "pred_peak": pred_peak,
                         "peak_relative_error": peak_relative_error,
@@ -1415,6 +1439,7 @@ def evaluate_field(
                         "target_hotspot_nodes": sample_hotspot_nodes,
                         "pred_hotspot_nodes": sample_pred_hotspot_nodes,
                         "hotspot_mae": sample_hotspot_abs / max(sample_hotspot_nodes, 1),
+                        "hotspot_log_mae": sample_hotspot_log_abs / max(sample_hotspot_nodes, 1),
                         "hotspot_within25_count": sample_hotspot_within_tolerance,
                         "hotspot_within25_ratio": sample_hotspot_within_tolerance / max(sample_hotspot_nodes, 1),
                         "hotspot_precision": sample_hotspot_precision,
@@ -1425,6 +1450,7 @@ def evaluate_field(
                         "hotspot_fn": sample_hotspot_fn,
                         "non_hotspot_nodes": sample_non_hotspot_nodes,
                         "non_hotspot_mae": sample_non_hotspot_abs / max(sample_non_hotspot_nodes, 1),
+                        "non_hotspot_log_mae": sample_non_hotspot_log_abs / max(sample_non_hotspot_nodes, 1),
                         "non_hotspot_within25_count": sample_non_hotspot_within_tolerance,
                         "non_hotspot_within25_ratio": sample_non_hotspot_within_tolerance / max(sample_non_hotspot_nodes, 1),
                         "non_hotspot_target_mean": sample_non_hotspot_target / max(sample_non_hotspot_nodes, 1),
@@ -1437,15 +1463,21 @@ def evaluate_field(
     metrics = {
         "loss": total_loss / denom,
         "stress_mae": total_stress_abs / denom,
+        "stress_log_mae": total_stress_log_abs / denom,
+        "stress_log_rmse": (total_stress_log_sq / denom) ** 0.5,
         "stress_top1_mae": total_top1_abs / max(total_top1_nodes, 1),
+        "stress_top1_log_mae": total_top1_log_abs / max(total_top1_nodes, 1),
         "stress_top5_mae": total_top5_abs / max(total_top5_nodes, 1),
+        "stress_top5_log_mae": total_top5_log_abs / max(total_top5_nodes, 1),
         "stress_peak_relative_error": total_peak_relative_error / max(total_cases, 1),
     }
     hotspot_within_tolerance_ratio = total_hotspot_within_tolerance / max(total_hotspot_nodes, 1)
     metrics["stress_hotspot_mae"] = total_hotspot_abs / max(total_hotspot_nodes, 1)
+    metrics["stress_hotspot_log_mae"] = total_hotspot_log_abs / max(total_hotspot_nodes, 1)
     metrics["stress_hotspot_within25_ratio"] = hotspot_within_tolerance_ratio
     metrics["stress_hotspot_miss25_rate"] = 1.0 - hotspot_within_tolerance_ratio
     metrics["stress_non_hotspot_mae"] = total_non_hotspot_abs / max(total_non_hotspot_nodes, 1)
+    metrics["stress_non_hotspot_log_mae"] = total_non_hotspot_log_abs / max(total_non_hotspot_nodes, 1)
     non_hotspot_within_tolerance_ratio = total_non_hotspot_within_tolerance / max(total_non_hotspot_nodes, 1)
     metrics["stress_non_hotspot_within25_ratio"] = non_hotspot_within_tolerance_ratio
     metrics["stress_non_hotspot_miss25_rate"] = 1.0 - non_hotspot_within_tolerance_ratio
@@ -1619,6 +1651,7 @@ class Case7Trainer:
             target_freq_key=self.dataset_cfg["target_freq_key"],
             make_undirected=bool(self.dataset_cfg["make_undirected"]),
             cache_dir=self.cache_dir,
+            node_region=self.dataset_cfg.get("node_region"),
             **get_mode_shape_loader_kwargs(self.feature_cfg),
         )
         return prepare_case(
