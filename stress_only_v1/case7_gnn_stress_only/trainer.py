@@ -1715,6 +1715,14 @@ class Case7Trainer:
         patience = int(self.training_cfg["early_stopping_patience"])
         wait = 0
 
+        self.logger.info(
+            "Starting training loop: epochs=%s | train_graphs=%s | batch_size=%s | eval_every=%s",
+            int(self.training_cfg["epochs"]),
+            len(self.train_case_paths),
+            batch_size,
+            eval_every,
+        )
+
         for epoch in range(1, int(self.training_cfg["epochs"]) + 1):
             train_loss = train_one_epoch(
                 model=self.model,
