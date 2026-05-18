@@ -461,7 +461,12 @@ def _case_group_key(case_path: Path) -> str:
     return case_path.name
 
 
-def make_training_batches(case_paths: list[Path], batch_size: int, same_case_only: bool) -> list[list[Path]]:
+def make_training_batches(
+    case_paths: list[Path],
+    batch_size: int,
+    same_case_only: bool,
+    shuffle_across_cases: bool = True,
+) -> list[list[Path]]:
     shuffled = list(case_paths)
     random.shuffle(shuffled)
     if batch_size <= 1:
@@ -480,8 +485,38 @@ def make_training_batches(case_paths: list[Path], batch_size: int, same_case_onl
         paths = grouped[key]
         random.shuffle(paths)
         batches.extend(paths[idx : idx + batch_size] for idx in range(0, len(paths), batch_size))
-    random.shuffle(batches)
+    if shuffle_across_cases:
+        random.shuffle(batches)
     return batches
+
+
+def make_evaluation_batches(case_paths: list[Path], batch_size: int, same_case_only: bool = True) -> list[list[Path]]:
+    if batch_size <= 1:
+        return [[path] for path in case_paths]
+    if not same_case_only:
+        return [case_paths[idx : idx + batch_size] for idx in range(0, len(case_paths), batch_size)]
+
+    grouped: dict[str, list[Path]] = {}
+    for path in case_paths:
+        grouped.setdefault(_case_group_key(path), []).append(path)
+
+    batches: list[list[Path]] = []
+    for key in sorted(grouped):
+        paths = sorted(grouped[key])
+        batches.extend(paths[idx : idx + batch_size] for idx in range(0, len(paths), batch_size))
+    return batches
+
+
+def select_evaluation_paths(case_paths: list[Path], sample_limit: int | None, seed: int) -> list[Path]:
+    if sample_limit is None:
+        return list(case_paths)
+    limit = int(sample_limit)
+    if limit <= 0:
+        return []
+    if limit >= len(case_paths):
+        return list(case_paths)
+    rng = random.Random(seed)
+    return sorted(rng.sample(list(case_paths), limit), key=lambda path: str(path))
 
 
 def _format_duration(seconds: float) -> str:
@@ -882,6 +917,22 @@ def build_stress_hotspot_targets(stress_values: torch.Tensor, cfg: dict[str, Any
     return build_rmises_hotspot_targets(stress_values, threshold=threshold)
 
 
+def build_stress_hotspot_targets_for_batch(
+    stress_values: torch.Tensor,
+    cfg: dict[str, Any],
+    batch: PreparedCase | None,
+) -> torch.Tensor:
+    if batch is None or batch.node_graph_index is None:
+        return build_stress_hotspot_targets(stress_values, cfg)
+
+    hotspot_target = torch.zeros_like(stress_values)
+    for graph_idx in range(batch.graph_count):
+        graph_mask = batch.node_graph_index == graph_idx
+        if graph_mask.any():
+            hotspot_target[graph_mask] = build_stress_hotspot_targets(stress_values[graph_mask], cfg)
+    return hotspot_target
+
+
 def compute_field_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -1060,7 +1111,7 @@ def compute_field_loss(
             ).mean() * relative_loss_weight
 
     if bool(two_stage_cfg["enabled"]):
-        hotspot_target = build_stress_hotspot_targets(stress_values, two_stage_cfg)
+        hotspot_target = build_stress_hotspot_targets_for_batch(stress_values, two_stage_cfg, batch)
         pos_weight = prediction.new_tensor(float(two_stage_cfg["positive_class_weight"]))
         hotspot_cls_loss = F.binary_cross_entropy_with_logits(
             prediction[:, 0],
@@ -1247,6 +1298,10 @@ def evaluate_field(
     diagnostic_split: str = "",
     diagnostic_epoch: int | None = None,
     amp_dtype: torch.dtype | None = None,
+    batch_size: int = 1,
+    batch_same_case_only: bool = True,
+    logger: Any | None = None,
+    progress_every_steps: int = 100,
 ) -> dict[str, float] | tuple[dict[str, float], list[dict[str, Any]]]:
     two_stage_cfg = two_stage_rmises_cfg or {"enabled": False}
     peak_relative_cfg = stress_peak_relative_cfg or {"enabled": False}
@@ -1260,6 +1315,10 @@ def evaluate_field(
     total_hotspot_tp = 0.0
     total_hotspot_fp = 0.0
     total_hotspot_fn = 0.0
+    total_pred_hotspot_nodes = 0
+    total_hotspot_prob = 0.0
+    max_hotspot_prob = 0.0
+    total_hotspot_prob_nodes = 0
     total_hotspot_abs = 0.0
     total_hotspot_log_abs = 0.0
     total_hotspot_nodes = 0
@@ -1280,11 +1339,31 @@ def evaluate_field(
     total_peak_relative_error = 0.0
     total_cases = 0
     diagnostic_rows: list[dict[str, Any]] = []
+    path_batches = make_evaluation_batches(
+        case_paths,
+        batch_size=max(1, int(batch_size)),
+        same_case_only=batch_same_case_only,
+    )
+    total_batches = len(path_batches)
+    eval_label = diagnostic_split or "eval"
+    started_at = time.monotonic()
+
+    if logger is not None:
+        logger.info(
+            "Eval %s start | batches=%s | graphs=%s | batch_size=%s",
+            eval_label,
+            total_batches,
+            len(case_paths),
+            max(1, int(batch_size)),
+        )
 
     model.eval()
     with torch.no_grad():
-        for case_path in case_paths:
-            batch = case_loader(case_path).to(device)
+        for step, path_batch in enumerate(path_batches, start=1):
+            prepared_cases = [case_loader(case_path) for case_path in path_batch]
+            node_counts = [int(case.node_features.size(0)) for case in prepared_cases]
+            edge_counts = [int(case.edge_features.size(0)) for case in prepared_cases]
+            batch = collate_prepared_cases(prepared_cases).to(device)
             with maybe_autocast(device, amp_dtype):
                 prediction = model(
                     batch.node_features,
@@ -1294,169 +1373,222 @@ def evaluate_field(
                     node_graph_index=batch.node_graph_index,
                     edge_graph_index=batch.edge_graph_index,
                 )
-            loss = compute_loss(
-                prediction,
-                batch.target_normalized,
-                loss_name=loss_name,
-                task="field",
-                target_metric=batch.target_metric,
-                batch=batch,
-                field_loss_cfg=field_loss_cfg,
-                two_stage_rmises_cfg=two_stage_cfg,
-                stress_peak_relative_cfg=peak_relative_cfg,
-            )
-            node_count = int(batch.node_features.size(0))
-            total_loss += loss.item() * node_count
-            total_nodes += node_count
-
-            prediction_raw, hotspot_prob, hotspot_mask = decode_field_prediction(
-                prediction=prediction,
-                target_scaler=scaler,
-                clamp_negative_rmises=clamp_negative_rmises,
-                two_stage_rmises_cfg=two_stage_cfg,
-                stress_peak_relative_cfg=peak_relative_cfg,
-            )
-            prediction_raw = prediction_raw.detach().cpu()
-            target_raw = batch.target_metric.detach().cpu()
-            error = (prediction_raw - target_raw).abs()
-            stress_target = target_raw[:, 0].clamp_min(0.0)
-            stress_prediction = prediction_raw[:, 0].clamp_min(0.0)
-            stress_error = error[:, 0]
-            stress_log_target = torch.log1p(stress_target)
-            stress_log_prediction = torch.log1p(stress_prediction)
-            stress_log_error = (stress_log_prediction - stress_log_target).abs()
-            total_stress_abs += stress_error.sum().item()
-            total_stress_log_abs += stress_log_error.sum().item()
-            total_stress_log_sq += stress_log_error.pow(2).sum().item()
-            total_cases += 1
-
-            target_peak = 0.0
-            pred_peak = 0.0
-            peak_relative_error = 0.0
-            if stress_target.numel() > 0:
-                target_peak = stress_target.max().item()
-                pred_peak = prediction_raw[:, 0].clamp_min(0.0).max().item()
-                peak_relative_error = abs(pred_peak - target_peak) / max(abs(target_peak), 1e-12)
-                total_peak_relative_error += peak_relative_error
-
-                top1_threshold = torch.quantile(stress_target, 0.99)
-                top1_mask = stress_target >= top1_threshold
-                total_top1_abs += stress_error[top1_mask].sum().item()
-                total_top1_log_abs += stress_log_error[top1_mask].sum().item()
-                total_top1_nodes += int(top1_mask.sum().item())
-
-                top5_threshold = torch.quantile(stress_target, 0.95)
-                top5_mask = stress_target >= top5_threshold
-                total_top5_abs += stress_error[top5_mask].sum().item()
-                total_top5_log_abs += stress_log_error[top5_mask].sum().item()
-                total_top5_nodes += int(top5_mask.sum().item())
-
-            hotspot_threshold = compute_stress_hotspot_threshold(stress_target, metric_hotspot_cfg)
-            target_hotspot = build_rmises_hotspot_targets(stress_target, threshold=hotspot_threshold).to(dtype=torch.bool)
-            sample_hotspot_abs = 0.0
-            sample_hotspot_log_abs = 0.0
-            sample_hotspot_within_tolerance = 0
-            sample_hotspot_nodes = int(target_hotspot.sum().item())
-            if target_hotspot.any():
-                sample_hotspot_abs = stress_error[target_hotspot].sum().item()
-                sample_hotspot_log_abs = stress_log_error[target_hotspot].sum().item()
-                total_hotspot_abs += sample_hotspot_abs
-                total_hotspot_log_abs += sample_hotspot_log_abs
-                total_hotspot_nodes += sample_hotspot_nodes
-                hotspot_relative_error = stress_error[target_hotspot] / stress_target[target_hotspot].abs().clamp_min(1e-12)
-                sample_hotspot_within_tolerance = int(
-                    (hotspot_relative_error <= float(metric_hotspot_cfg["within_relative_error"])).sum().item()
+            node_start = 0
+            edge_start = 0
+            for sample_index, prepared_case in enumerate(prepared_cases):
+                node_count = node_counts[sample_index]
+                edge_count = edge_counts[sample_index]
+                node_end = node_start + node_count
+                edge_end = edge_start + edge_count
+                sample_global_features = (
+                    batch.global_features[sample_index]
+                    if batch.global_features.dim() == 2
+                    else batch.global_features
                 )
-                total_hotspot_within_tolerance += sample_hotspot_within_tolerance
-
-            non_hotspot_mask = ~target_hotspot
-            sample_non_hotspot_abs = 0.0
-            sample_non_hotspot_log_abs = 0.0
-            sample_non_hotspot_target = 0.0
-            sample_non_hotspot_pred = 0.0
-            sample_non_hotspot_bias = 0.0
-            sample_non_hotspot_within_tolerance = 0
-            sample_non_hotspot_nodes = int(non_hotspot_mask.sum().item())
-            if non_hotspot_mask.any():
-                sample_non_hotspot_abs = stress_error[non_hotspot_mask].sum().item()
-                sample_non_hotspot_log_abs = stress_log_error[non_hotspot_mask].sum().item()
-                sample_non_hotspot_target = stress_target[non_hotspot_mask].sum().item()
-                sample_non_hotspot_pred = stress_prediction[non_hotspot_mask].sum().item()
-                sample_non_hotspot_bias = (stress_prediction[non_hotspot_mask] - stress_target[non_hotspot_mask]).sum().item()
-                non_hotspot_relative_error = stress_error[non_hotspot_mask] / stress_target[non_hotspot_mask].abs().clamp_min(1e-12)
-                sample_non_hotspot_within_tolerance = int(
-                    (non_hotspot_relative_error <= float(metric_hotspot_cfg["within_relative_error"])).sum().item()
+                sample_batch = PreparedCase(
+                    name=prepared_case.name,
+                    frequency_hz=prepared_case.frequency_hz,
+                    node_features=batch.node_features[node_start:node_end],
+                    edge_index=batch.edge_index[:, edge_start:edge_end] - node_start,
+                    edge_features=batch.edge_features[edge_start:edge_end],
+                    node_bc_mask=batch.node_bc_mask[node_start:node_end],
+                    edge_distance=batch.edge_distance[edge_start:edge_end],
+                    global_features=sample_global_features,
+                    target_normalized=batch.target_normalized[node_start:node_end],
+                    target_metric=batch.target_metric[node_start:node_end],
                 )
-                total_non_hotspot_abs += sample_non_hotspot_abs
-                total_non_hotspot_log_abs += sample_non_hotspot_log_abs
-                total_non_hotspot_target += sample_non_hotspot_target
-                total_non_hotspot_pred += sample_non_hotspot_pred
-                total_non_hotspot_bias += sample_non_hotspot_bias
-                total_non_hotspot_nodes += sample_non_hotspot_nodes
-                total_non_hotspot_within_tolerance += sample_non_hotspot_within_tolerance
-
-            sample_hotspot_tp = 0.0
-            sample_hotspot_fp = 0.0
-            sample_hotspot_fn = 0.0
-            sample_hotspot_precision = None
-            sample_hotspot_recall = None
-            sample_hotspot_f1 = None
-            sample_pred_hotspot_nodes = None
-            if bool(two_stage_cfg["enabled"]):
-                assert hotspot_prob is not None and hotspot_mask is not None
-                pred_hotspot = hotspot_mask.detach().cpu().to(dtype=torch.bool)
-                sample_pred_hotspot_nodes = int(pred_hotspot.sum().item())
-                sample_hotspot_tp = float((pred_hotspot & target_hotspot).sum().item())
-                sample_hotspot_fp = float((pred_hotspot & ~target_hotspot).sum().item())
-                sample_hotspot_fn = float((~pred_hotspot & target_hotspot).sum().item())
-                total_hotspot_tp += sample_hotspot_tp
-                total_hotspot_fp += sample_hotspot_fp
-                total_hotspot_fn += sample_hotspot_fn
-                sample_hotspot_precision = sample_hotspot_tp / max(sample_hotspot_tp + sample_hotspot_fp, 1.0)
-                sample_hotspot_recall = sample_hotspot_tp / max(sample_hotspot_tp + sample_hotspot_fn, 1.0)
-                sample_hotspot_f1 = (2.0 * sample_hotspot_precision * sample_hotspot_recall) / max(
-                    sample_hotspot_precision + sample_hotspot_recall,
-                    1e-12,
+                sample_prediction = prediction[node_start:node_end]
+                loss = compute_loss(
+                    sample_prediction,
+                    sample_batch.target_normalized,
+                    loss_name=loss_name,
+                    task="field",
+                    target_metric=sample_batch.target_metric,
+                    batch=sample_batch,
+                    field_loss_cfg=field_loss_cfg,
+                    two_stage_rmises_cfg=two_stage_cfg,
+                    stress_peak_relative_cfg=peak_relative_cfg,
                 )
+                total_loss += loss.item() * node_count
+                total_nodes += node_count
 
-            if collect_diagnostics:
-                case_name, _ = split_sample_name(batch.name)
-                diagnostic_rows.append(
-                    {
-                        "epoch": diagnostic_epoch,
-                        "split": diagnostic_split,
-                        "sample": batch.name,
-                        "case": case_name,
-                        "frequency_hz": batch.frequency_hz,
-                        "node_count": node_count,
-                        "loss": loss.item(),
-                        "stress_mae": stress_error.mean().item(),
-                        "stress_log_mae": stress_log_error.mean().item(),
-                        "target_peak": target_peak,
-                        "pred_peak": pred_peak,
-                        "peak_relative_error": peak_relative_error,
-                        "hotspot_threshold": hotspot_threshold,
-                        "target_hotspot_nodes": sample_hotspot_nodes,
-                        "pred_hotspot_nodes": sample_pred_hotspot_nodes,
-                        "hotspot_mae": sample_hotspot_abs / max(sample_hotspot_nodes, 1),
-                        "hotspot_log_mae": sample_hotspot_log_abs / max(sample_hotspot_nodes, 1),
-                        "hotspot_within25_count": sample_hotspot_within_tolerance,
-                        "hotspot_within25_ratio": sample_hotspot_within_tolerance / max(sample_hotspot_nodes, 1),
-                        "hotspot_precision": sample_hotspot_precision,
-                        "hotspot_recall": sample_hotspot_recall,
-                        "hotspot_f1": sample_hotspot_f1,
-                        "hotspot_tp": sample_hotspot_tp,
-                        "hotspot_fp": sample_hotspot_fp,
-                        "hotspot_fn": sample_hotspot_fn,
-                        "non_hotspot_nodes": sample_non_hotspot_nodes,
-                        "non_hotspot_mae": sample_non_hotspot_abs / max(sample_non_hotspot_nodes, 1),
-                        "non_hotspot_log_mae": sample_non_hotspot_log_abs / max(sample_non_hotspot_nodes, 1),
-                        "non_hotspot_within25_count": sample_non_hotspot_within_tolerance,
-                        "non_hotspot_within25_ratio": sample_non_hotspot_within_tolerance / max(sample_non_hotspot_nodes, 1),
-                        "non_hotspot_target_mean": sample_non_hotspot_target / max(sample_non_hotspot_nodes, 1),
-                        "non_hotspot_pred_mean": sample_non_hotspot_pred / max(sample_non_hotspot_nodes, 1),
-                        "non_hotspot_bias": sample_non_hotspot_bias / max(sample_non_hotspot_nodes, 1),
-                    }
+                prediction_raw, hotspot_prob, hotspot_mask = decode_field_prediction(
+                    prediction=sample_prediction,
+                    target_scaler=scaler,
+                    clamp_negative_rmises=clamp_negative_rmises,
+                    two_stage_rmises_cfg=two_stage_cfg,
+                    stress_peak_relative_cfg=peak_relative_cfg,
+                )
+                prediction_raw = prediction_raw.detach().cpu()
+                target_raw = sample_batch.target_metric.detach().cpu()
+                error = (prediction_raw - target_raw).abs()
+                stress_target = target_raw[:, 0].clamp_min(0.0)
+                stress_prediction = prediction_raw[:, 0].clamp_min(0.0)
+                stress_error = error[:, 0]
+                stress_log_target = torch.log1p(stress_target)
+                stress_log_prediction = torch.log1p(stress_prediction)
+                stress_log_error = (stress_log_prediction - stress_log_target).abs()
+                total_stress_abs += stress_error.sum().item()
+                total_stress_log_abs += stress_log_error.sum().item()
+                total_stress_log_sq += stress_log_error.pow(2).sum().item()
+                total_cases += 1
+
+                target_peak = 0.0
+                pred_peak = 0.0
+                peak_relative_error = 0.0
+                if stress_target.numel() > 0:
+                    target_peak = stress_target.max().item()
+                    pred_peak = prediction_raw[:, 0].clamp_min(0.0).max().item()
+                    peak_relative_error = abs(pred_peak - target_peak) / max(abs(target_peak), 1e-12)
+                    total_peak_relative_error += peak_relative_error
+
+                    top1_threshold = torch.quantile(stress_target, 0.99)
+                    top1_mask = stress_target >= top1_threshold
+                    total_top1_abs += stress_error[top1_mask].sum().item()
+                    total_top1_log_abs += stress_log_error[top1_mask].sum().item()
+                    total_top1_nodes += int(top1_mask.sum().item())
+
+                    top5_threshold = torch.quantile(stress_target, 0.95)
+                    top5_mask = stress_target >= top5_threshold
+                    total_top5_abs += stress_error[top5_mask].sum().item()
+                    total_top5_log_abs += stress_log_error[top5_mask].sum().item()
+                    total_top5_nodes += int(top5_mask.sum().item())
+
+                hotspot_threshold = compute_stress_hotspot_threshold(stress_target, metric_hotspot_cfg)
+                target_hotspot = build_rmises_hotspot_targets(stress_target, threshold=hotspot_threshold).to(dtype=torch.bool)
+                sample_hotspot_abs = 0.0
+                sample_hotspot_log_abs = 0.0
+                sample_hotspot_within_tolerance = 0
+                sample_hotspot_nodes = int(target_hotspot.sum().item())
+                if target_hotspot.any():
+                    sample_hotspot_abs = stress_error[target_hotspot].sum().item()
+                    sample_hotspot_log_abs = stress_log_error[target_hotspot].sum().item()
+                    total_hotspot_abs += sample_hotspot_abs
+                    total_hotspot_log_abs += sample_hotspot_log_abs
+                    total_hotspot_nodes += sample_hotspot_nodes
+                    hotspot_relative_error = stress_error[target_hotspot] / stress_target[target_hotspot].abs().clamp_min(1e-12)
+                    sample_hotspot_within_tolerance = int(
+                        (hotspot_relative_error <= float(metric_hotspot_cfg["within_relative_error"])).sum().item()
+                    )
+                    total_hotspot_within_tolerance += sample_hotspot_within_tolerance
+
+                non_hotspot_mask = ~target_hotspot
+                sample_non_hotspot_abs = 0.0
+                sample_non_hotspot_log_abs = 0.0
+                sample_non_hotspot_target = 0.0
+                sample_non_hotspot_pred = 0.0
+                sample_non_hotspot_bias = 0.0
+                sample_non_hotspot_within_tolerance = 0
+                sample_non_hotspot_nodes = int(non_hotspot_mask.sum().item())
+                if non_hotspot_mask.any():
+                    sample_non_hotspot_abs = stress_error[non_hotspot_mask].sum().item()
+                    sample_non_hotspot_log_abs = stress_log_error[non_hotspot_mask].sum().item()
+                    sample_non_hotspot_target = stress_target[non_hotspot_mask].sum().item()
+                    sample_non_hotspot_pred = stress_prediction[non_hotspot_mask].sum().item()
+                    sample_non_hotspot_bias = (
+                        stress_prediction[non_hotspot_mask] - stress_target[non_hotspot_mask]
+                    ).sum().item()
+                    non_hotspot_relative_error = (
+                        stress_error[non_hotspot_mask] / stress_target[non_hotspot_mask].abs().clamp_min(1e-12)
+                    )
+                    sample_non_hotspot_within_tolerance = int(
+                        (non_hotspot_relative_error <= float(metric_hotspot_cfg["within_relative_error"])).sum().item()
+                    )
+                    total_non_hotspot_abs += sample_non_hotspot_abs
+                    total_non_hotspot_log_abs += sample_non_hotspot_log_abs
+                    total_non_hotspot_target += sample_non_hotspot_target
+                    total_non_hotspot_pred += sample_non_hotspot_pred
+                    total_non_hotspot_bias += sample_non_hotspot_bias
+                    total_non_hotspot_nodes += sample_non_hotspot_nodes
+                    total_non_hotspot_within_tolerance += sample_non_hotspot_within_tolerance
+
+                sample_hotspot_tp = 0.0
+                sample_hotspot_fp = 0.0
+                sample_hotspot_fn = 0.0
+                sample_hotspot_precision = None
+                sample_hotspot_recall = None
+                sample_hotspot_f1 = None
+                sample_pred_hotspot_nodes = None
+                if bool(two_stage_cfg["enabled"]):
+                    assert hotspot_prob is not None and hotspot_mask is not None
+                    hotspot_prob_cpu = hotspot_prob.detach().cpu()
+                    pred_hotspot = hotspot_mask.detach().cpu().to(dtype=torch.bool)
+                    sample_pred_hotspot_nodes = int(pred_hotspot.sum().item())
+                    sample_hotspot_tp = float((pred_hotspot & target_hotspot).sum().item())
+                    sample_hotspot_fp = float((pred_hotspot & ~target_hotspot).sum().item())
+                    sample_hotspot_fn = float((~pred_hotspot & target_hotspot).sum().item())
+                    total_hotspot_tp += sample_hotspot_tp
+                    total_hotspot_fp += sample_hotspot_fp
+                    total_hotspot_fn += sample_hotspot_fn
+                    total_pred_hotspot_nodes += sample_pred_hotspot_nodes
+                    total_hotspot_prob += hotspot_prob_cpu.sum().item()
+                    max_hotspot_prob = max(max_hotspot_prob, hotspot_prob_cpu.max().item())
+                    total_hotspot_prob_nodes += int(hotspot_prob_cpu.numel())
+                    sample_hotspot_precision = sample_hotspot_tp / max(sample_hotspot_tp + sample_hotspot_fp, 1.0)
+                    sample_hotspot_recall = sample_hotspot_tp / max(sample_hotspot_tp + sample_hotspot_fn, 1.0)
+                    sample_hotspot_f1 = (2.0 * sample_hotspot_precision * sample_hotspot_recall) / max(
+                        sample_hotspot_precision + sample_hotspot_recall,
+                        1e-12,
+                    )
+
+                if collect_diagnostics:
+                    case_name, _ = split_sample_name(sample_batch.name)
+                    diagnostic_rows.append(
+                        {
+                            "epoch": diagnostic_epoch,
+                            "split": diagnostic_split,
+                            "sample": sample_batch.name,
+                            "case": case_name,
+                            "frequency_hz": sample_batch.frequency_hz,
+                            "node_count": node_count,
+                            "loss": loss.item(),
+                            "stress_mae": stress_error.mean().item(),
+                            "stress_log_mae": stress_log_error.mean().item(),
+                            "target_peak": target_peak,
+                            "pred_peak": pred_peak,
+                            "peak_relative_error": peak_relative_error,
+                            "hotspot_threshold": hotspot_threshold,
+                            "target_hotspot_nodes": sample_hotspot_nodes,
+                            "pred_hotspot_nodes": sample_pred_hotspot_nodes,
+                            "hotspot_mae": sample_hotspot_abs / max(sample_hotspot_nodes, 1),
+                            "hotspot_log_mae": sample_hotspot_log_abs / max(sample_hotspot_nodes, 1),
+                            "hotspot_within25_count": sample_hotspot_within_tolerance,
+                            "hotspot_within25_ratio": sample_hotspot_within_tolerance / max(sample_hotspot_nodes, 1),
+                            "hotspot_precision": sample_hotspot_precision,
+                            "hotspot_recall": sample_hotspot_recall,
+                            "hotspot_f1": sample_hotspot_f1,
+                            "hotspot_tp": sample_hotspot_tp,
+                            "hotspot_fp": sample_hotspot_fp,
+                            "hotspot_fn": sample_hotspot_fn,
+                            "non_hotspot_nodes": sample_non_hotspot_nodes,
+                            "non_hotspot_mae": sample_non_hotspot_abs / max(sample_non_hotspot_nodes, 1),
+                            "non_hotspot_log_mae": sample_non_hotspot_log_abs / max(sample_non_hotspot_nodes, 1),
+                            "non_hotspot_within25_count": sample_non_hotspot_within_tolerance,
+                            "non_hotspot_within25_ratio": sample_non_hotspot_within_tolerance / max(sample_non_hotspot_nodes, 1),
+                            "non_hotspot_target_mean": sample_non_hotspot_target / max(sample_non_hotspot_nodes, 1),
+                            "non_hotspot_pred_mean": sample_non_hotspot_pred / max(sample_non_hotspot_nodes, 1),
+                            "non_hotspot_bias": sample_non_hotspot_bias / max(sample_non_hotspot_nodes, 1),
+                        }
+                    )
+
+                node_start = node_end
+                edge_start = edge_end
+
+            if logger is not None and (
+                step == 1
+                or step == total_batches
+                or (progress_every_steps > 0 and step % progress_every_steps == 0)
+            ):
+                elapsed = time.monotonic() - started_at
+                eta = elapsed / max(step, 1) * max(total_batches - step, 0)
+                logger.info(
+                    "Eval %s progress | step=%s/%s | %.1f%% | elapsed=%s | eta=%s",
+                    eval_label,
+                    step,
+                    total_batches,
+                    100.0 * step / max(total_batches, 1),
+                    _format_duration(elapsed),
+                    _format_duration(eta),
                 )
 
     denom = max(total_nodes, 1)
@@ -1491,6 +1623,10 @@ def evaluate_field(
         metrics["hotspot_precision"] = precision
         metrics["hotspot_recall"] = recall
         metrics["hotspot_f1"] = f1
+        metrics["hotspot_target_nodes"] = float(total_hotspot_nodes)
+        metrics["hotspot_pred_nodes"] = float(total_pred_hotspot_nodes)
+        metrics["hotspot_prob_mean"] = total_hotspot_prob / max(total_hotspot_prob_nodes, 1)
+        metrics["hotspot_prob_max"] = max_hotspot_prob
     if collect_diagnostics:
         return metrics, diagnostic_rows
     return metrics
@@ -1511,6 +1647,7 @@ def train_one_epoch(
     amp_dtype: torch.dtype | None = None,
     batch_size: int = 1,
     batch_same_case_only: bool = True,
+    batch_shuffle_across_cases: bool = True,
     logger: Any | None = None,
     epoch: int | None = None,
     progress_every_steps: int = 100,
@@ -1520,6 +1657,7 @@ def train_one_epoch(
         case_paths,
         batch_size=max(1, int(batch_size)),
         same_case_only=batch_same_case_only,
+        shuffle_across_cases=batch_shuffle_across_cases,
     )
     total_batches = len(path_batches)
     started_at = time.monotonic()
@@ -1594,6 +1732,9 @@ def _save_checkpoint(
     model: torch.nn.Module,
     scalers: dict[str, StandardScaler],
     metrics: dict[str, Any],
+    filename: str = "best.pt",
+    optimizer: torch.optim.Optimizer | None = None,
+    training_state: dict[str, Any] | None = None,
 ) -> None:
     checkpoint = {
         "model_state": model.state_dict(),
@@ -1601,7 +1742,18 @@ def _save_checkpoint(
         "scalers": {name: scaler.state_dict() for name, scaler in scalers.items()},
         "metrics": metrics,
     }
-    torch.save(checkpoint, save_dir / "best.pt")
+    if optimizer is not None:
+        checkpoint["optimizer_state"] = optimizer.state_dict()
+    if training_state is not None:
+        checkpoint["training_state"] = training_state
+    torch.save(checkpoint, save_dir / filename)
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
 
 
 class Case7Trainer:
@@ -1640,8 +1792,14 @@ class Case7Trainer:
         self.val_case_paths: list[Path] = []
         self.test_case_paths: list[Path] = []
         self.resolved_config: dict[str, Any] = {}
+        self.start_epoch = 1
+        self.best_val_score = float("inf")
+        self.best_payload: dict[str, Any] | None = None
+        self.early_stop_wait = 0
+        self.last_payload: dict[str, Any] | None = None
 
         self._prepare()
+        self._maybe_resume()
 
     def _load_prepared_case(self, case_path: Path) -> PreparedCase:
         case = load_case_graph(
@@ -1723,10 +1881,56 @@ class Case7Trainer:
         self.resolved_config["stress_hotspot_metric"] = dict(self.hotspot_metric_cfg)
         write_yaml(self.save_dir / "resolved_config.yaml", self.resolved_config)
 
+    def _resolve_resume_path(self) -> Path | None:
+        resume_from = self.training_cfg.get("resume_from")
+        if resume_from is None or resume_from is False:
+            return None
+        if resume_from is True or str(resume_from).strip().lower() == "auto":
+            return self.save_dir / "last.pt"
+        return Path(str(resume_from))
+
+    def _maybe_resume(self) -> None:
+        resume_path = self._resolve_resume_path()
+        if resume_path is None:
+            return
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
+        assert self.model is not None
+        assert self.optimizer is not None
+
+        checkpoint = torch.load(resume_path, map_location="cpu")
+        self.model.load_state_dict(checkpoint["model_state"])
+
+        checkpoint_scalers = checkpoint.get("scalers")
+        if checkpoint_scalers:
+            self.scalers = {
+                name: StandardScaler.from_state_dict(state)
+                for name, state in checkpoint_scalers.items()
+            }
+
+        if bool(self.training_cfg.get("resume_optimizer", True)):
+            optimizer_state = checkpoint.get("optimizer_state")
+            if optimizer_state is None:
+                self.logger.warning("Resume checkpoint has no optimizer_state; continuing with a fresh optimizer.")
+            else:
+                self.optimizer.load_state_dict(optimizer_state)
+                _move_optimizer_state_to_device(self.optimizer, self.device)
+
+        training_state = dict(checkpoint.get("training_state", {}))
+        checkpoint_epoch = int(training_state.get("epoch", checkpoint.get("metrics", {}).get("epoch", 0)))
+        self.start_epoch = checkpoint_epoch + 1
+        self.best_val_score = float(training_state.get("best_val_score", float("inf")))
+        self.best_payload = training_state.get("best_payload")
+        self.early_stop_wait = int(training_state.get("wait", 0))
+        self.last_payload = checkpoint.get("metrics")
+        self.logger.info("Resumed training from %s at epoch %s.", resume_path, checkpoint_epoch)
+
     def _evaluate(
         self,
         case_paths: list[Path],
         loss_name: str,
+        batch_size: int = 1,
+        batch_same_case_only: bool = True,
         collect_diagnostics: bool = False,
         diagnostic_split: str = "",
         diagnostic_epoch: int | None = None,
@@ -1761,6 +1965,10 @@ class Case7Trainer:
             diagnostic_split=diagnostic_split,
             diagnostic_epoch=diagnostic_epoch,
             amp_dtype=self.amp_dtype,
+            batch_size=batch_size,
+            batch_same_case_only=batch_same_case_only,
+            logger=self.logger,
+            progress_every_steps=int(self.training_cfg.get("eval_progress_every_steps", 100)),
         )
 
     def _append_history_row(self, row: dict[str, Any]) -> None:
@@ -1834,26 +2042,72 @@ class Case7Trainer:
             self.logger.info("Scaler fit case limit: %s", self.dataset_cfg["scaler_fit_case_limit"])
         batch_size = int(self.training_cfg.get("batch_size", 1))
         batch_same_case_only = bool(self.training_cfg.get("batch_same_case_only", True))
+        batch_shuffle_across_cases = bool(self.training_cfg.get("batch_shuffle_across_cases", True))
+        eval_batch_size = int(self.training_cfg.get("eval_batch_size", batch_size))
+        eval_batch_same_case_only = bool(self.training_cfg.get("eval_batch_same_case_only", batch_same_case_only))
+        eval_train = bool(self.training_cfg.get("eval_train", True))
+        eval_val = bool(self.training_cfg.get("eval_val", True))
+        eval_test = bool(self.training_cfg.get("eval_test", True))
+        eval_diagnostics = bool(self.training_cfg.get("eval_diagnostics", True))
+        eval_sample_seed = int(self.training_cfg.get("eval_sample_seed", int(self.training_cfg.get("seed", 42))))
+        eval_train_paths = select_evaluation_paths(
+            self.train_case_paths,
+            self.training_cfg.get("eval_train_sample_limit"),
+            eval_sample_seed,
+        )
+        eval_val_paths = select_evaluation_paths(
+            self.val_case_paths,
+            self.training_cfg.get("eval_val_sample_limit"),
+            eval_sample_seed + 1,
+        )
+        eval_test_paths = select_evaluation_paths(
+            self.test_case_paths,
+            self.training_cfg.get("eval_test_sample_limit"),
+            eval_sample_seed + 2,
+        )
         progress_every_steps = int(self.training_cfg.get("progress_every_steps", 100))
         self.logger.info("Training graph batch size: %s", batch_size)
         self.logger.info("Batch same case only: %s", batch_same_case_only)
+        self.logger.info("Batch shuffle across cases: %s", batch_shuffle_across_cases)
+        self.logger.info(
+            "Eval splits enabled: train=%s | val=%s | test=%s | diagnostics=%s",
+            eval_train,
+            eval_val,
+            eval_test,
+            eval_diagnostics,
+        )
+        self.logger.info(
+            "Eval graphs: train=%s/%s | val=%s/%s | test=%s/%s | batch_size=%s",
+            len(eval_train_paths),
+            len(self.train_case_paths),
+            len(eval_val_paths),
+            len(self.val_case_paths),
+            len(eval_test_paths),
+            len(self.test_case_paths),
+            eval_batch_size,
+        )
         self.logger.info("Training progress log every steps: %s", progress_every_steps)
 
         selection_metric = str(self.training_cfg.get("selection_metric", "loss"))
-        best_val_score = float("inf")
-        best_payload: dict[str, Any] | None = None
+        best_val_score = self.best_val_score
+        best_payload = self.best_payload
         patience = int(self.training_cfg["early_stopping_patience"])
-        wait = 0
+        wait = self.early_stop_wait
+        save_last_checkpoint = bool(self.training_cfg.get("save_last_checkpoint", True))
+        save_last_every = int(self.training_cfg.get("save_last_every", 1))
+        if save_last_every <= 0:
+            raise ValueError("training.save_last_every must be positive.")
 
         self.logger.info(
-            "Starting training loop: epochs=%s | train_graphs=%s | batch_size=%s | eval_every=%s",
+            "Starting training loop: start_epoch=%s | epochs=%s | train_graphs=%s | batch_size=%s | eval_every=%s",
+            self.start_epoch,
             int(self.training_cfg["epochs"]),
             len(self.train_case_paths),
             batch_size,
             eval_every,
         )
 
-        for epoch in range(1, int(self.training_cfg["epochs"]) + 1):
+        for epoch in range(self.start_epoch, int(self.training_cfg["epochs"]) + 1):
             train_loss = train_one_epoch(
                 model=self.model,
                 case_paths=self.train_case_paths,
@@ -1869,6 +2123,7 @@ class Case7Trainer:
                 amp_dtype=self.amp_dtype,
                 batch_size=batch_size,
                 batch_same_case_only=batch_same_case_only,
+                batch_shuffle_across_cases=batch_shuffle_across_cases,
                 logger=self.logger,
                 epoch=epoch,
                 progress_every_steps=progress_every_steps,
@@ -1881,35 +2136,93 @@ class Case7Trainer:
 
             if epoch % eval_every != 0:
                 self._append_history_row(history_row)
+                self.last_payload = {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "selection_metric": selection_metric,
+                    "selection_score": None,
+                    "train_metrics": {},
+                    "val_metrics": {},
+                    "test_metrics": {},
+                }
+                if save_last_checkpoint and (epoch % save_last_every == 0 or epoch == int(self.training_cfg["epochs"])):
+                    _save_checkpoint(
+                        save_dir=self.save_dir,
+                        config=self.resolved_config,
+                        model=self.model,
+                        scalers=self.scalers,
+                        metrics=self.last_payload,
+                        filename="last.pt",
+                        optimizer=self.optimizer,
+                        training_state={
+                            "epoch": epoch,
+                            "best_val_score": best_val_score,
+                            "best_payload": best_payload,
+                            "wait": wait,
+                        },
+                    )
                 if epoch == 1 or epoch % int(self.training_cfg["print_every"]) == 0:
                     self.logger.info("Epoch %04d | train_loss=%.6f | eval=skipped", epoch, train_loss)
                 continue
 
-            train_metrics, train_diagnostics = self._evaluate(
-                self.train_case_paths,
-                loss_name=self.training_cfg["loss"],
-                collect_diagnostics=True,
-                diagnostic_split="train",
-                diagnostic_epoch=epoch,
-            )
-            val_metrics, val_diagnostics = self._evaluate(
-                self.val_case_paths,
-                loss_name=self.training_cfg["loss"],
-                collect_diagnostics=True,
-                diagnostic_split="val",
-                diagnostic_epoch=epoch,
-            )
-            test_metrics, test_diagnostics = self._evaluate(
-                self.test_case_paths,
-                loss_name=self.training_cfg["loss"],
-                collect_diagnostics=True,
-                diagnostic_split="test",
-                diagnostic_epoch=epoch,
-            )
+            train_metrics: dict[str, float] = {}
+            val_metrics: dict[str, float] = {}
+            test_metrics: dict[str, float] = {}
+            train_diagnostics: list[dict[str, Any]] = []
+            val_diagnostics: list[dict[str, Any]] = []
+            test_diagnostics: list[dict[str, Any]] = []
 
-            history_row["train_eval_loss"] = round(float(train_metrics["loss"]), 8)
-            history_row["val_loss"] = round(float(val_metrics["loss"]), 8)
-            history_row["test_loss"] = round(float(test_metrics["loss"]), 8)
+            if eval_train:
+                train_eval_result = self._evaluate(
+                    eval_train_paths,
+                    loss_name=self.training_cfg["loss"],
+                    batch_size=eval_batch_size,
+                    batch_same_case_only=eval_batch_same_case_only,
+                    collect_diagnostics=eval_diagnostics,
+                    diagnostic_split="train",
+                    diagnostic_epoch=epoch,
+                )
+                if eval_diagnostics:
+                    train_metrics, train_diagnostics = train_eval_result
+                else:
+                    train_metrics = train_eval_result
+
+            if eval_val:
+                val_eval_result = self._evaluate(
+                    eval_val_paths,
+                    loss_name=self.training_cfg["loss"],
+                    batch_size=eval_batch_size,
+                    batch_same_case_only=eval_batch_same_case_only,
+                    collect_diagnostics=eval_diagnostics,
+                    diagnostic_split="val",
+                    diagnostic_epoch=epoch,
+                )
+                if eval_diagnostics:
+                    val_metrics, val_diagnostics = val_eval_result
+                else:
+                    val_metrics = val_eval_result
+
+            if eval_test:
+                test_eval_result = self._evaluate(
+                    eval_test_paths,
+                    loss_name=self.training_cfg["loss"],
+                    batch_size=eval_batch_size,
+                    batch_same_case_only=eval_batch_same_case_only,
+                    collect_diagnostics=eval_diagnostics,
+                    diagnostic_split="test",
+                    diagnostic_epoch=epoch,
+                )
+                if eval_diagnostics:
+                    test_metrics, test_diagnostics = test_eval_result
+                else:
+                    test_metrics = test_eval_result
+
+            if train_metrics:
+                history_row["train_eval_loss"] = round(float(train_metrics["loss"]), 8)
+            if val_metrics:
+                history_row["val_loss"] = round(float(val_metrics["loss"]), 8)
+            if test_metrics:
+                history_row["test_loss"] = round(float(test_metrics["loss"]), 8)
             for key, value in train_metrics.items():
                 if key != "loss":
                     history_row[f"train_{key}"] = round(float(value), 8)
@@ -1922,50 +2235,96 @@ class Case7Trainer:
             self._append_history_row(history_row)
 
             if epoch == 1 or epoch % int(self.training_cfg["print_every"]) == 0:
+                metric_parts = []
+                if train_metrics:
+                    metric_parts.append(f"train_eval={json.dumps(train_metrics, ensure_ascii=False)}")
+                if val_metrics:
+                    metric_parts.append(f"val={json.dumps(val_metrics, ensure_ascii=False)}")
+                if test_metrics:
+                    metric_parts.append(f"test={json.dumps(test_metrics, ensure_ascii=False)}")
                 self.logger.info(
-                    "Epoch %04d | train_loss=%.6f | train_eval=%s | val=%s | test=%s",
+                    "Epoch %04d | train_loss=%.6f | %s",
                     epoch,
                     train_loss,
-                    json.dumps(train_metrics, ensure_ascii=False),
-                    json.dumps(val_metrics, ensure_ascii=False),
-                    json.dumps(test_metrics, ensure_ascii=False),
+                    " | ".join(metric_parts),
                 )
 
-            if selection_metric not in val_metrics:
-                raise KeyError(f"Validation metric '{selection_metric}' is not available: {sorted(val_metrics)}")
-            val_score = float(val_metrics[selection_metric])
+            self.last_payload = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "selection_metric": selection_metric,
+                "selection_score": float(val_metrics[selection_metric]) if selection_metric in val_metrics else None,
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+                "test_metrics": test_metrics,
+            }
 
-            if val_score < best_val_score:
-                best_val_score = val_score
-                wait = 0
-                best_payload = {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "selection_metric": selection_metric,
-                    "selection_score": val_score,
-                    "train_metrics": train_metrics,
-                    "val_metrics": val_metrics,
-                    "test_metrics": test_metrics,
-                }
+            if not val_metrics:
+                self.logger.info("Epoch %04d | validation eval disabled; best checkpoint selection skipped.", epoch)
+            elif selection_metric not in val_metrics:
+                raise KeyError(f"Validation metric '{selection_metric}' is not available: {sorted(val_metrics)}")
+            else:
+                val_score = float(val_metrics[selection_metric])
+                if val_score < best_val_score:
+                    best_val_score = val_score
+                    wait = 0
+                    best_payload = self.last_payload
+                    _save_checkpoint(
+                        save_dir=self.save_dir,
+                        config=self.resolved_config,
+                        model=self.model,
+                        scalers=self.scalers,
+                        metrics=best_payload,
+                    )
+                    write_json(self.save_dir / "metrics.json", best_payload)
+                    if eval_diagnostics:
+                        write_field_diagnostics_csv(self.save_dir / "best_train_diagnostics.csv", train_diagnostics)
+                        write_field_diagnostics_csv(self.save_dir / "best_val_diagnostics.csv", val_diagnostics)
+                        write_field_diagnostics_csv(self.save_dir / "best_test_diagnostics.csv", test_diagnostics)
+                else:
+                    wait += 1
+                    if wait >= patience:
+                        self.logger.info("Early stopping at epoch %s.", epoch)
+                        if save_last_checkpoint:
+                            _save_checkpoint(
+                                save_dir=self.save_dir,
+                                config=self.resolved_config,
+                                model=self.model,
+                                scalers=self.scalers,
+                                metrics=self.last_payload,
+                                filename="last.pt",
+                                optimizer=self.optimizer,
+                                training_state={
+                                    "epoch": epoch,
+                                    "best_val_score": best_val_score,
+                                    "best_payload": best_payload,
+                                    "wait": wait,
+                                },
+                            )
+                        break
+
+            if save_last_checkpoint and (epoch % save_last_every == 0 or epoch == int(self.training_cfg["epochs"])):
                 _save_checkpoint(
                     save_dir=self.save_dir,
                     config=self.resolved_config,
                     model=self.model,
                     scalers=self.scalers,
-                    metrics=best_payload,
+                    metrics=self.last_payload,
+                    filename="last.pt",
+                    optimizer=self.optimizer,
+                    training_state={
+                        "epoch": epoch,
+                        "best_val_score": best_val_score,
+                        "best_payload": best_payload,
+                        "wait": wait,
+                    },
                 )
-                write_json(self.save_dir / "metrics.json", best_payload)
-                write_field_diagnostics_csv(self.save_dir / "best_train_diagnostics.csv", train_diagnostics)
-                write_field_diagnostics_csv(self.save_dir / "best_val_diagnostics.csv", val_diagnostics)
-                write_field_diagnostics_csv(self.save_dir / "best_test_diagnostics.csv", test_diagnostics)
-            else:
-                wait += 1
-                if wait >= patience:
-                    self.logger.info("Early stopping at epoch %s.", epoch)
-                    break
 
-        if best_payload is None:
-            raise RuntimeError("Training finished without a saved checkpoint.")
+        if best_payload is not None:
+            self.logger.info("Best run summary:\n%s", json.dumps(best_payload, indent=2, ensure_ascii=False))
+            return best_payload
+        if self.last_payload is None:
+            raise RuntimeError("Training finished without any completed epoch.")
 
-        self.logger.info("Best run summary:\n%s", json.dumps(best_payload, indent=2, ensure_ascii=False))
-        return best_payload
+        self.logger.info("Last run summary:\n%s", json.dumps(self.last_payload, indent=2, ensure_ascii=False))
+        return self.last_payload

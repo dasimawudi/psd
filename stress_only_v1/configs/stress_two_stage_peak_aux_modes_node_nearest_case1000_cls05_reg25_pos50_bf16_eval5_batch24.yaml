@@ -54,12 +54,21 @@ training:
   amp: bf16
   batch_size: 24
   batch_same_case_only: true
+  batch_shuffle_across_cases: false
   epochs: 30
   lr: 0.001
   weight_decay: 0.0001
   grad_clip: 1.0
   loss: smooth_l1
   eval_every: 5
+  eval_batch_size: 24
+  eval_batch_same_case_only: true
+  eval_train: false
+  eval_val: true
+  eval_test: false
+  eval_diagnostics: false
+  save_last_checkpoint: true
+  save_last_every: 1
   print_every: 1
   early_stopping_patience: 6
   selection_metric: stress_hotspot_miss25_rate
@@ -93,10 +102,10 @@ stress_two_stage:
   threshold_peak_ratio: 0.05
   threshold_combine: min
   prob_threshold: 0.5
-  classification_weight: 0.5
+  classification_weight: 1.0
   regression_weight: 2.5
   background_regression_weight: 0.02
-  positive_class_weight: 50.0
+  positive_class_weight: 150.0
   within_relative_error: 0.25
 
 stress_peak_relative:
