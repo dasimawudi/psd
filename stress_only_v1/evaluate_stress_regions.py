@@ -388,7 +388,7 @@ def _load_prepared_case(
         target_freq_key=dataset_cfg.get("target_freq_key", "freq_top3"),
         make_undirected=bool(dataset_cfg.get("make_undirected", True)),
         cache_dir=dataset_cfg.get("cache_dir"),
-        mode_shape_loader_kwargs=get_mode_shape_loader_kwargs(feature_cfg),
+        **get_mode_shape_loader_kwargs(feature_cfg),
     )
     return prepare_case(
         case,
