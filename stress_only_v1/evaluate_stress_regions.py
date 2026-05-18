@@ -20,6 +20,7 @@ from case7_gnn_stress_only.scalers import StandardScaler
 from case7_gnn_stress_only.trainer import (
     PreparedCase,
     build_model,
+    compute_stress_hotspot_threshold,
     decode_field_prediction,
     get_mode_shape_loader_kwargs,
     get_stress_hotspot_metric_cfg,
@@ -35,6 +36,7 @@ REGION_FIELDNAMES = [
     "case",
     "frequency_hz",
     "region",
+    "node_scope",
     "node_count",
     "mae",
     "rmse",
@@ -66,6 +68,7 @@ REGION_FIELDNAMES = [
 SUMMARY_FIELDNAMES = [
     "split",
     "region",
+    "node_scope",
     "node_count",
     "sample_count",
     "mae",
@@ -207,6 +210,7 @@ def _metric_row(
     case_name: str,
     frequency_hz: float | None,
     region: str,
+    node_scope: str,
     stress_target: torch.Tensor,
     stress_pred: torch.Tensor,
     mask: torch.Tensor,
@@ -242,6 +246,7 @@ def _metric_row(
         "case": case_name,
         "frequency_hz": frequency_hz,
         "region": region,
+        "node_scope": node_scope,
         "node_count": node_count,
         "mae": float(abs_error.mean().item()),
         "rmse": float(torch.sqrt(squared_error.mean()).item()),
@@ -271,8 +276,8 @@ def _metric_row(
     }
 
 
-def _accumulate(summary: dict[tuple[str, str], dict[str, float]], row: dict[str, Any]) -> None:
-    key = (str(row["split"]), str(row["region"]))
+def _accumulate(summary: dict[tuple[str, str, str], dict[str, float]], row: dict[str, Any]) -> None:
+    key = (str(row["split"]), str(row["region"]), str(row["node_scope"]))
     stats = summary.setdefault(
         key,
         {
@@ -315,9 +320,9 @@ def _accumulate(summary: dict[tuple[str, str], dict[str, float]], row: dict[str,
     stats["sample_count"] += 1.0
 
 
-def _finalize_summary(summary: dict[tuple[str, str], dict[str, float]]) -> list[dict[str, Any]]:
+def _finalize_summary(summary: dict[tuple[str, str, str], dict[str, float]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for (split, region), stats in sorted(summary.items()):
+    for (split, region, node_scope), stats in sorted(summary.items()):
         node_count = max(stats["node_count"], 1.0)
         sample_count = max(stats["sample_count"], 1.0)
         within_ratio = stats["within25_count"] / node_count
@@ -329,6 +334,7 @@ def _finalize_summary(summary: dict[tuple[str, str], dict[str, float]]) -> list[
             {
                 "split": split,
                 "region": region,
+                "node_scope": node_scope,
                 "node_count": int(stats["node_count"]),
                 "sample_count": int(stats["sample_count"]),
                 "mae": stats["abs_error_sum"] / node_count,
@@ -450,7 +456,7 @@ def main() -> None:
     model.eval()
 
     sample_rows: list[dict[str, Any]] = []
-    summary_accumulator: dict[tuple[str, str], dict[str, float]] = {}
+    summary_accumulator: dict[tuple[str, str, str], dict[str, float]] = {}
 
     with torch.no_grad():
         for split in splits:
@@ -473,6 +479,8 @@ def main() -> None:
                 )
                 stress_pred = prediction_raw.detach().cpu()[:, 0].clamp_min(0.0)
                 stress_target = batch.target_metric.detach().cpu()[:, 0].clamp_min(0.0)
+                hotspot_threshold = compute_stress_hotspot_threshold(stress_target, hotspot_metric_cfg)
+                true_hotspot_mask = stress_target >= hotspot_threshold
                 raw_features = _raw_node_features(batch.node_features, scalers["node"])
                 payload = _load_global_payload(sample_path)
                 masks = _region_masks(
@@ -485,21 +493,28 @@ def main() -> None:
                 )
                 case_name = _case_name_from_sample_path(sample_path)
                 for region, mask in masks.items():
-                    row = _metric_row(
-                        split=split,
-                        sample=batch.name,
-                        case_name=case_name,
-                        frequency_hz=batch.frequency_hz,
-                        region=region,
-                        stress_target=stress_target,
-                        stress_pred=stress_pred,
-                        mask=mask,
-                        within_relative_error=within_relative_error,
-                    )
-                    if row is None:
-                        continue
-                    sample_rows.append(row)
-                    _accumulate(summary_accumulator, row)
+                    scoped_masks = {
+                        "all_nodes": mask,
+                        "true_hotspot": mask & true_hotspot_mask,
+                        "non_hotspot": mask & ~true_hotspot_mask,
+                    }
+                    for node_scope, scoped_mask in scoped_masks.items():
+                        row = _metric_row(
+                            split=split,
+                            sample=batch.name,
+                            case_name=case_name,
+                            frequency_hz=batch.frequency_hz,
+                            region=region,
+                            node_scope=node_scope,
+                            stress_target=stress_target,
+                            stress_pred=stress_pred,
+                            mask=scoped_mask,
+                            within_relative_error=within_relative_error,
+                        )
+                        if row is None:
+                            continue
+                        sample_rows.append(row)
+                        _accumulate(summary_accumulator, row)
 
     summary_rows = _finalize_summary(summary_accumulator)
     _write_csv(output_dir / "region_sample_metrics.csv", sample_rows, REGION_FIELDNAMES)
