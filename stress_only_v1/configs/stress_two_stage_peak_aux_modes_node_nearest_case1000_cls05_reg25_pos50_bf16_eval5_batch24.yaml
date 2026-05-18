@@ -72,7 +72,7 @@ training:
   print_every: 1
   early_stopping_patience: 6
   selection_metric: stress_hotspot_miss25_rate
-  save_dir: stress_only_v1/outputs/stress_two_stage_peak_aux_modes_node_nearest_case1000_topk5_peak1_boost8_cls05_reg25_pos50_bf16_eval5_batch24
+  save_dir: stress_only_v1/outputs/stress_two_stage_peak_aux_modes_node_nearest_case1000_topk5_peak1_boost8_cls05_reg25_pos50_bf16_eval5_batch24_fast_clsfix
 
 field_loss:
   stress_loss_weight: 1.0
