@@ -43,6 +43,8 @@ REGION_FIELDNAMES = [
     "within25_count",
     "within25_ratio",
     "miss25_rate",
+    "log_rel_within25_count",
+    "log_rel_within25_ratio",
     "mean_relative_error",
     "median_relative_error",
     "p90_relative_error",
@@ -76,6 +78,8 @@ SUMMARY_FIELDNAMES = [
     "within25_count",
     "within25_ratio",
     "miss25_rate",
+    "log_rel_within25_count",
+    "log_rel_within25_ratio",
     "mean_relative_error",
     "mean_symmetric_relative_error",
     "mean_sample_median_relative_error",
@@ -226,6 +230,10 @@ def _metric_row(
     abs_error = signed_error.abs()
     squared_error = signed_error.pow(2.0)
     relative_error = abs_error / target.abs().clamp_min(1e-12)
+    log_target = torch.log1p(target)
+    log_pred = torch.log1p(pred)
+    log_relative_error = (log_pred - log_target).abs() / log_target.abs().clamp_min(1e-12)
+    log_rel_within_count = int((log_relative_error <= within_relative_error).sum().item())
     symmetric_relative_error = 2.0 * abs_error / (pred.abs() + target.abs()).clamp_min(1e-12)
     within_count = int((relative_error <= within_relative_error).sum().item())
     under_pred = pred < target
@@ -253,6 +261,8 @@ def _metric_row(
         "within25_count": within_count,
         "within25_ratio": within_count / max(node_count, 1),
         "miss25_rate": 1.0 - within_count / max(node_count, 1),
+        "log_rel_within25_count": log_rel_within_count,
+        "log_rel_within25_ratio": log_rel_within_count / max(node_count, 1),
         "mean_relative_error": float(relative_error.mean().item()),
         "median_relative_error": float(torch.quantile(relative_error, 0.50).item()),
         "p90_relative_error": float(torch.quantile(relative_error, 0.90).item()),
@@ -285,6 +295,7 @@ def _accumulate(summary: dict[tuple[str, str, str], dict[str, float]], row: dict
             "abs_error_sum": 0.0,
             "squared_error_sum": 0.0,
             "within25_count": 0.0,
+            "log_rel_within25_count": 0.0,
             "relative_error_sum": 0.0,
             "symmetric_relative_error_sum": 0.0,
             "sample_median_relative_error_weighted_sum": 0.0,
@@ -305,6 +316,7 @@ def _accumulate(summary: dict[tuple[str, str, str], dict[str, float]], row: dict
     stats["abs_error_sum"] += float(row["mae"]) * node_count
     stats["squared_error_sum"] += float(row["rmse"]) ** 2.0 * node_count
     stats["within25_count"] += float(row["within25_count"])
+    stats["log_rel_within25_count"] += float(row["log_rel_within25_count"])
     stats["relative_error_sum"] += float(row["mean_relative_error"]) * node_count
     stats["symmetric_relative_error_sum"] += float(row["mean_symmetric_relative_error"]) * node_count
     stats["sample_median_relative_error_weighted_sum"] += float(row["median_relative_error"]) * node_count
@@ -326,6 +338,7 @@ def _finalize_summary(summary: dict[tuple[str, str, str], dict[str, float]]) -> 
         node_count = max(stats["node_count"], 1.0)
         sample_count = max(stats["sample_count"], 1.0)
         within_ratio = stats["within25_count"] / node_count
+        log_rel_within_ratio = stats["log_rel_within25_count"] / node_count
         target_sum = stats["target_sum"]
         target_sq_sum = stats["target_sq_sum"]
         sst = target_sq_sum - (target_sum * target_sum / node_count)
@@ -342,6 +355,8 @@ def _finalize_summary(summary: dict[tuple[str, str, str], dict[str, float]]) -> 
                 "within25_count": int(stats["within25_count"]),
                 "within25_ratio": within_ratio,
                 "miss25_rate": 1.0 - within_ratio,
+                "log_rel_within25_count": int(stats["log_rel_within25_count"]),
+                "log_rel_within25_ratio": log_rel_within_ratio,
                 "mean_relative_error": stats["relative_error_sum"] / node_count,
                 "mean_symmetric_relative_error": stats["symmetric_relative_error_sum"] / node_count,
                 "mean_sample_median_relative_error": stats["sample_median_relative_error_weighted_sum"] / node_count,
