@@ -48,6 +48,7 @@ class PreparedPointSample:
     target_raw: torch.Tensor
     node_indices: torch.Tensor
     point_weights: torch.Tensor
+    region_masks: dict[str, torch.Tensor] | None = None
 
     @property
     def num_points(self) -> int:
@@ -66,6 +67,7 @@ class PointBatch:
     sample_index: torch.Tensor
     node_indices: torch.Tensor
     point_weights: torch.Tensor
+    region_masks: dict[str, torch.Tensor] | None = None
 
     @property
     def num_points(self) -> int:
@@ -83,6 +85,11 @@ class PointBatch:
             sample_index=self.sample_index.to(device),
             node_indices=self.node_indices.to(device),
             point_weights=self.point_weights.to(device),
+            region_masks=(
+                {name: mask.to(device) for name, mask in self.region_masks.items()}
+                if self.region_masks is not None
+                else None
+            ),
         )
 
     def pin_memory(self) -> "PointBatch":
@@ -97,6 +104,11 @@ class PointBatch:
             sample_index=self.sample_index.pin_memory(),
             node_indices=self.node_indices.pin_memory(),
             point_weights=self.point_weights.pin_memory(),
+            region_masks=(
+                {name: mask.pin_memory() for name, mask in self.region_masks.items()}
+                if self.region_masks is not None
+                else None
+            ),
         )
 
 
@@ -112,6 +124,14 @@ TOPK_WITHIN25_GROUPS = [
     ("top5", 0.0, 0.05),
     ("top5_10", 0.05, 0.10),
     ("top10", 0.0, 0.10),
+]
+
+
+REGION_TOPK_METRIC_SPECS = [
+    ("fullpart_stress", "fullpart_region"),
+    ("earpiece_region_stress", "earpiece_region"),
+    ("disk_stress", "disk_region"),
+    ("disk_center_stress", "disk_center_region"),
 ]
 
 
@@ -339,6 +359,39 @@ def _update_topk_metric_totals(
 
 
 def _finalize_topk_metric_totals(totals_by_group: dict[str, dict[str, float]]) -> dict[str, float]:
+    return _finalize_topk_metric_totals_with_prefix(totals_by_group, prefix="earpiece_stress")
+
+
+def _finalize_point_metric_totals_with_prefix(totals: dict[str, float], prefix: str) -> dict[str, float]:
+    group_metrics = _finalize_point_metrics(totals)
+    field_map = {
+        "points": "points",
+        "relative_points": "relative_points",
+        "mae": "earpiece_stress_mae",
+        "rmse": "earpiece_stress_rmse",
+        "log_mae": "earpiece_stress_log_mae",
+        "log_rmse": "earpiece_stress_log_rmse",
+        "bias": "earpiece_stress_bias",
+        "relative_mae": "earpiece_stress_relative_mae",
+        "symmetric_relative_mae": "earpiece_stress_symmetric_relative_mae",
+        "within25_ratio": "earpiece_stress_within25_ratio",
+        "miss25_rate": "earpiece_stress_miss25_rate",
+        "under_pred_ratio": "earpiece_stress_under_pred_ratio",
+        "over_pred_ratio": "earpiece_stress_over_pred_ratio",
+        "target_mean": "earpiece_stress_target_mean",
+        "pred_mean": "earpiece_stress_pred_mean",
+    }
+    metrics = {f"{prefix}_{suffix}": float(group_metrics[source]) for suffix, source in field_map.items()}
+    target_mean = max(abs(group_metrics["earpiece_stress_target_mean"]), 1e-12)
+    metrics[f"{prefix}_pred_target_ratio"] = group_metrics["earpiece_stress_pred_mean"] / target_mean
+    return metrics
+
+
+def _finalize_topk_metric_totals_with_prefix(
+    totals_by_group: dict[str, dict[str, float]],
+    *,
+    prefix: str,
+) -> dict[str, float]:
     metrics: dict[str, float] = {}
     field_map = {
         "points": "points",
@@ -356,9 +409,9 @@ def _finalize_topk_metric_totals(totals_by_group: dict[str, dict[str, float]]) -
     for name, totals in totals_by_group.items():
         group_metrics = _finalize_point_metrics(totals)
         for suffix, source in field_map.items():
-            metrics[f"earpiece_stress_{name}_{suffix}"] = float(group_metrics[source])
+            metrics[f"{prefix}_{name}_{suffix}"] = float(group_metrics[source])
         target_mean = max(abs(group_metrics["earpiece_stress_target_mean"]), 1e-12)
-        metrics[f"earpiece_stress_{name}_pred_target_ratio"] = (
+        metrics[f"{prefix}_{name}_pred_target_ratio"] = (
             group_metrics["earpiece_stress_pred_mean"] / target_mean
         )
     return metrics
@@ -778,6 +831,9 @@ def prepare_point_sample(
     target_log = torch.log1p(target_raw).unsqueeze(-1)
     target_scaled = y_scaler.transform(target_log)
     point_weights = _build_point_weights(target_raw, schema, loss_cfg or {})
+    region_masks = None
+    if raw.region_masks:
+        region_masks = {name: mask.to(dtype=torch.bool) for name, mask in raw.region_masks.items()}
     return PreparedPointSample(
         name=raw.name,
         case_name=raw.case_name,
@@ -788,6 +844,7 @@ def prepare_point_sample(
         target_raw=target_raw.to(dtype=torch.float32),
         node_indices=raw.node_indices,
         point_weights=point_weights.to(dtype=torch.float32),
+        region_masks=region_masks,
     )
 
 
@@ -861,6 +918,14 @@ def collate_point_samples(samples: list[PreparedPointSample]) -> PointBatch:
     names = []
     case_names = []
     frequencies = []
+    region_mask_names = sorted(
+        {
+            name
+            for sample in samples
+            for name in ((sample.region_masks or {}).keys())
+        }
+    )
+    region_masks: dict[str, list[torch.Tensor]] = {name: [] for name in region_mask_names}
     for sample_idx, sample in enumerate(samples):
         names.append(sample.name)
         case_names.append(sample.case_name)
@@ -872,6 +937,11 @@ def collate_point_samples(samples: list[PreparedPointSample]) -> PointBatch:
         point_weights.append(sample.point_weights)
         node_indices.append(sample.node_indices)
         sample_indices.append(torch.full((sample.num_points,), sample_idx, dtype=torch.long))
+        for name in region_mask_names:
+            mask = (sample.region_masks or {}).get(name)
+            if mask is None:
+                mask = torch.zeros((sample.num_points,), dtype=torch.bool)
+            region_masks[name].append(mask.to(dtype=torch.bool).reshape(-1))
 
     return PointBatch(
         names=names,
@@ -884,6 +954,7 @@ def collate_point_samples(samples: list[PreparedPointSample]) -> PointBatch:
         sample_index=torch.cat(sample_indices, dim=0),
         node_indices=torch.cat(node_indices, dim=0),
         point_weights=torch.cat(point_weights, dim=0),
+        region_masks={name: torch.cat(parts, dim=0) for name, parts in region_masks.items()} if region_masks else None,
     )
 
 
@@ -1455,6 +1526,8 @@ def evaluate(
     model.eval()
     totals = _empty_point_metric_totals()
     topk_totals = _empty_topk_metric_totals()
+    region_totals = {prefix: _empty_point_metric_totals() for prefix, _ in REGION_TOPK_METRIC_SPECS}
+    region_topk_totals = {prefix: _empty_topk_metric_totals() for prefix, _ in REGION_TOPK_METRIC_SPECS}
     top1_abs_sum = 0.0
     top1_log_abs_sum = 0.0
     top1_count = 0
@@ -1547,6 +1620,32 @@ def evaluate(
                     target_log=sample_target_log,
                     target_raw=sample_target,
                 )
+                for region_prefix, region_name in REGION_TOPK_METRIC_SPECS:
+                    region_mask_all = (
+                        host_batch.region_masks.get(region_name)
+                        if host_batch.region_masks is not None
+                        else None
+                    )
+                    if region_mask_all is None:
+                        continue
+                    sample_region_mask = region_mask_all[mask].to(dtype=torch.bool)
+                    if not bool(sample_region_mask.any()):
+                        continue
+                    _update_point_metric_totals(
+                        region_totals[region_prefix],
+                        loss_sum=0.0,
+                        pred_log=sample_pred_log[sample_region_mask],
+                        pred_raw=sample_pred[sample_region_mask],
+                        target_log=sample_target_log[sample_region_mask],
+                        target_raw=sample_target[sample_region_mask],
+                    )
+                    _update_topk_metric_totals(
+                        region_topk_totals[region_prefix],
+                        pred_log=sample_pred_log[sample_region_mask],
+                        pred_raw=sample_pred[sample_region_mask],
+                        target_log=sample_target_log[sample_region_mask],
+                        target_raw=sample_target[sample_region_mask],
+                    )
 
                 if collect_diagnostics:
                     sample_points = int(sample_target.numel())
@@ -1646,6 +1745,14 @@ def evaluate(
         }
     )
     metrics.update(_finalize_topk_metric_totals(topk_totals))
+    for region_prefix, _ in REGION_TOPK_METRIC_SPECS:
+        metrics.update(_finalize_point_metric_totals_with_prefix(region_totals[region_prefix], region_prefix))
+        metrics.update(
+            _finalize_topk_metric_totals_with_prefix(
+                region_topk_totals[region_prefix],
+                prefix=region_prefix,
+            )
+        )
     return EvaluationResult(metrics=metrics, diagnostics=diagnostics)
 
 

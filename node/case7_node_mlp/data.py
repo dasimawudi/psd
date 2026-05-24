@@ -131,6 +131,7 @@ class RawPointSample:
     geometry_feature_names: list[str]
     scaled_feature_names: list[str]
     mask_feature_names: list[str]
+    region_masks: dict[str, torch.Tensor] | None = None
 
     @property
     def num_points(self) -> int:
@@ -1653,6 +1654,16 @@ def load_raw_point_sample(
     selected_indices = torch.tensor(selected_indices_np, dtype=torch.long)
     target_raw = torch.tensor(target_values[selected_indices_np], dtype=torch.float32)
     target_log = torch.log1p(target_raw.clamp_min(0.0)).unsqueeze(-1)
+    selected_earpiece_mask = earpiece_mask[selected_indices_np].astype(bool, copy=False)
+    disk_center_mask = (
+        _node_mask_values(nodes_df, "center_couple_mask") | _node_mask_values(nodes_df, "center_node_mask")
+    )[selected_indices_np]
+    region_masks = {
+        "fullpart_region": torch.ones(selected_indices.numel(), dtype=torch.bool),
+        "earpiece_region": torch.tensor(selected_earpiece_mask, dtype=torch.bool),
+        "disk_region": torch.tensor(~selected_earpiece_mask, dtype=torch.bool),
+        "disk_center_region": torch.tensor(disk_center_mask, dtype=torch.bool),
+    }
 
     geometry, scaled, masks, geometry_names, scaled_names, mask_names = _build_base_features(
         nodes_df=nodes_df,
@@ -1675,4 +1686,5 @@ def load_raw_point_sample(
         geometry_feature_names=geometry_names,
         scaled_feature_names=scaled_names,
         mask_feature_names=mask_names,
+        region_masks=region_masks,
     )
