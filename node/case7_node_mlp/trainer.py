@@ -460,6 +460,7 @@ def _build_point_weights(
     target_raw: torch.Tensor,
     feature_schema: dict[str, Any],
     loss_cfg: dict[str, Any],
+    region_masks: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     weights = torch.ones_like(target_raw, dtype=torch.float32)
     weighting = str(loss_cfg.get("weighting", "none")).lower()
@@ -488,6 +489,17 @@ def _build_point_weights(
         if max_value is not None:
             mask &= target_raw < float(max_value)
         weights = torch.where(mask, torch.maximum(weights, torch.full_like(weights, bucket_weight)), weights)
+
+    center_weight = float(loss_cfg.get("center_region_point_weight", 1.0))
+    if center_weight > 1.0 and region_masks is not None and "disk_center_region" in region_masks:
+        center_mask = region_masks["disk_center_region"].to(dtype=torch.bool, device=target_raw.device).reshape(-1)
+        if bool(center_mask.any()):
+            quantile = min(max(float(loss_cfg.get("center_region_top_quantile", 0.95)), 0.0), 1.0)
+            min_target = float(loss_cfg.get("center_region_min_target", 0.0))
+            center_targets = target_raw.reshape(-1)[center_mask]
+            threshold = torch.quantile(center_targets, quantile)
+            peak_mask = center_mask & (target_raw.reshape(-1) >= threshold) & (target_raw.reshape(-1) > min_target)
+            weights = torch.where(peak_mask, weights * center_weight, weights)
     return weights
 
 
@@ -814,6 +826,89 @@ def _compute_sample_tail_aux_loss(
     return torch.stack(losses).mean()
 
 
+def _compute_disk_center_tail_aux_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_raw: torch.Tensor,
+    sample_index: torch.Tensor,
+    region_mask: torch.Tensor | None,
+    loss_cfg: dict[str, Any],
+) -> torch.Tensor:
+    peak_weight = float(loss_cfg.get("disk_center_peak_loss_weight", 0.0))
+    top5_weight = float(loss_cfg.get("disk_center_top5_loss_weight", 0.0))
+    top1_weight = float(loss_cfg.get("disk_center_top1_loss_weight", 0.0))
+    mean_weight = float(loss_cfg.get("disk_center_mean_loss_weight", 0.0))
+    if peak_weight <= 0.0 and top5_weight <= 0.0 and top1_weight <= 0.0 and mean_weight <= 0.0:
+        return prediction.new_zeros(())
+    if region_mask is None:
+        return prediction.new_zeros(())
+
+    pred_flat = prediction.reshape(-1)
+    target_flat = target.reshape(-1)
+    target_raw_flat = target_raw.reshape(-1)
+    sample_index = sample_index.reshape(-1)
+    region_mask = region_mask.to(dtype=torch.bool, device=prediction.device).reshape(-1)
+    if not bool(region_mask.any()):
+        return prediction.new_zeros(())
+
+    top5_quantile = float(loss_cfg.get("disk_center_top5_quantile", loss_cfg.get("sample_top5_quantile", 0.95)))
+    top1_quantile = float(loss_cfg.get("disk_center_top1_quantile", loss_cfg.get("sample_top1_quantile", 0.99)))
+    min_points = max(1, int(loss_cfg.get("disk_center_min_points", 1)))
+    min_target = float(loss_cfg.get("disk_center_min_target", 0.0))
+
+    losses: list[torch.Tensor] = []
+    for sample_id in torch.unique(sample_index):
+        mask = (sample_index == sample_id) & region_mask
+        if int(mask.sum().item()) < min_points:
+            continue
+        sample_pred = pred_flat[mask]
+        sample_target = target_flat[mask]
+        sample_target_raw = target_raw_flat[mask]
+
+        sample_losses: list[torch.Tensor] = []
+        if peak_weight > 0.0:
+            sample_losses.append(
+                peak_weight
+                * F.smooth_l1_loss(
+                    sample_pred.max().reshape(1),
+                    sample_target.max().reshape(1),
+                    reduction="mean",
+                )
+            )
+        if mean_weight > 0.0:
+            sample_losses.append(
+                mean_weight
+                * F.smooth_l1_loss(
+                    sample_pred.mean().reshape(1),
+                    sample_target.mean().reshape(1),
+                    reduction="mean",
+                )
+            )
+        if top5_weight > 0.0 and sample_target_raw.numel() > 0:
+            threshold = torch.quantile(sample_target_raw, min(max(top5_quantile, 0.0), 1.0))
+            top_mask = (sample_target_raw >= threshold) & (sample_target_raw > min_target)
+            if bool(top_mask.any()):
+                sample_losses.append(
+                    top5_weight
+                    * F.smooth_l1_loss(sample_pred[top_mask], sample_target[top_mask], reduction="mean")
+                )
+        if top1_weight > 0.0 and sample_target_raw.numel() > 0:
+            threshold = torch.quantile(sample_target_raw, min(max(top1_quantile, 0.0), 1.0))
+            top_mask = (sample_target_raw >= threshold) & (sample_target_raw > min_target)
+            if bool(top_mask.any()):
+                sample_losses.append(
+                    top1_weight
+                    * F.smooth_l1_loss(sample_pred[top_mask], sample_target[top_mask], reduction="mean")
+                )
+
+        if sample_losses:
+            losses.append(torch.stack(sample_losses).sum())
+
+    if not losses:
+        return prediction.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def prepare_point_sample(
     raw: RawPointSample,
     x_scaler: StandardScaler,
@@ -830,10 +925,15 @@ def prepare_point_sample(
     target_raw = _apply_target_floor(raw.target_raw, target_floor)
     target_log = torch.log1p(target_raw).unsqueeze(-1)
     target_scaled = y_scaler.transform(target_log)
-    point_weights = _build_point_weights(target_raw, schema, loss_cfg or {})
     region_masks = None
     if raw.region_masks:
         region_masks = {name: mask.to(dtype=torch.bool) for name, mask in raw.region_masks.items()}
+    point_weights = _build_point_weights(
+        target_raw,
+        schema,
+        loss_cfg or {},
+        region_masks=region_masks,
+    )
     return PreparedPointSample(
         name=raw.name,
         case_name=raw.case_name,
@@ -1416,6 +1516,19 @@ def train_one_epoch(
                     target=target,
                     target_raw=target_raw_chunk,
                     sample_index=host_batch.sample_index[chunk].to(device, non_blocking=True),
+                    loss_cfg=loss_cfg,
+                )
+                disk_center_region_mask = (
+                    host_batch.region_masks.get("disk_center_region")[chunk].to(device, non_blocking=True)
+                    if host_batch.region_masks is not None and "disk_center_region" in host_batch.region_masks
+                    else None
+                )
+                aux_loss = aux_loss + _compute_disk_center_tail_aux_loss(
+                    prediction=prediction,
+                    target=target,
+                    target_raw=target_raw_chunk,
+                    sample_index=host_batch.sample_index[chunk].to(device, non_blocking=True),
+                    region_mask=disk_center_region_mask,
                     loss_cfg=loss_cfg,
                 )
                 low_target_loss = _compute_low_target_overprediction_loss(
