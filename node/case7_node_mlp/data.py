@@ -336,6 +336,10 @@ def _combined_node_mask(nodes_df: pd.DataFrame, columns: Sequence[str]) -> np.nd
     return mask
 
 
+def _build_disk_center_region_mask(nodes_df: pd.DataFrame) -> np.ndarray:
+    return _combined_node_mask(nodes_df, ("center_couple_mask", "center_node_mask"))
+
+
 def _pointset_cache_key(pointset_cfg: dict[str, Any] | None) -> str:
     return json.dumps(pointset_cfg or {}, sort_keys=True, separators=(",", ":"))
 
@@ -398,6 +402,8 @@ def _build_node_scope_mask(
     scope = str(raw_scope).strip().lower()
     if scope in {"earpiece", "earpiece_only", "ear"}:
         mask = earpiece_mask.astype(bool, copy=True)
+    elif scope in {"disk_center", "center", "center_region", "disk_center_region"}:
+        mask = _build_disk_center_region_mask(nodes_df)
     elif scope in {"all", "all_nodes", "full", "full_part", "fullpart"}:
         mask = np.ones(len(nodes_df), dtype=bool)
     else:
@@ -1655,9 +1661,7 @@ def load_raw_point_sample(
     target_raw = torch.tensor(target_values[selected_indices_np], dtype=torch.float32)
     target_log = torch.log1p(target_raw.clamp_min(0.0)).unsqueeze(-1)
     selected_earpiece_mask = earpiece_mask[selected_indices_np].astype(bool, copy=False)
-    disk_center_mask = (
-        _node_mask_values(nodes_df, "center_couple_mask") | _node_mask_values(nodes_df, "center_node_mask")
-    )[selected_indices_np]
+    disk_center_mask = _build_disk_center_region_mask(nodes_df)[selected_indices_np]
     region_masks = {
         "fullpart_region": torch.ones(selected_indices.numel(), dtype=torch.bool),
         "earpiece_region": torch.tensor(selected_earpiece_mask, dtype=torch.bool),

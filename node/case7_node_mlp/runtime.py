@@ -26,8 +26,39 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
-def read_config(path: str | Path) -> dict[str, Any]:
-    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+def _deep_merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def read_config(path: str | Path, _seen: set[Path] | None = None) -> dict[str, Any]:
+    config_path = Path(path).resolve()
+    seen = set() if _seen is None else set(_seen)
+    if config_path in seen:
+        raise ValueError(f"Recursive config base_config reference: {config_path}")
+    seen.add(config_path)
+
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Config must be a mapping: {config_path}")
+
+    base_ref = config.pop("base_config", None) or config.pop("inherits", None)
+    if base_ref is None:
+        return config
+
+    base_refs = base_ref if isinstance(base_ref, list) else [base_ref]
+    merged: dict[str, Any] = {}
+    for item in base_refs:
+        base_path = Path(str(item))
+        if not base_path.is_absolute():
+            base_path = config_path.parent / base_path
+        merged = _deep_merge_config(merged, read_config(base_path, _seen=seen))
+    return _deep_merge_config(merged, config)
 
 
 def ensure_dir(path: str | Path) -> Path:
