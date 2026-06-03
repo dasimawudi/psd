@@ -1,0 +1,96 @@
+dataset:
+  root: .cache/mises_psd_next1000_full_export_step0p5_balanced_v1
+  sample_mode: per_frequency
+  include_zero_frequency: false
+  min_frequency_hz: 20.0
+  max_frequency_hz: 2000.0
+  split_mode: ratio
+  split_seed: 42
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  earpiece_region:
+    enabled: true
+    type: earpiece
+    width_scale: 1.5
+
+features:
+  use_psd: true
+  include_psd_value_at_frequency: true
+  include_log_psd_value_at_frequency: true
+  include_earpiece_local_features: true
+  earpiece_root_band: 4.0
+  earpiece_bridge_tau: 2.0
+  earpiece_bridge_width: 8.0
+  use_mode_shapes: true
+  mode_shape_columns: [U1, U2, U3, U_mag]
+  mode_shape_count: 10
+  mode_shape_normalization: max_umag
+  include_shape_normalized_mode_features: true
+  mode_shape_extra_normalizations: [rms_umag]
+  mode_shape_weighting: resonance
+  mode_shape_damping_ratio: 0.02
+  mode_shape_modal_frequency_power: 2.0
+  include_modal_ratio_features: true
+  include_modal_frf_features: true
+  modal_frf_damping_ratios: [0.01, 0.02, 0.05]
+  modal_frf_amp_clip: 1000.0
+  modal_frf_topk: 3
+
+target:
+  zero_below: "p99*1e-8"
+
+loss:
+  weighting: target_quantile
+  top5_weight: 4.0
+  top1_weight: 12.0
+  sample_peak_loss_weight: 0.35
+  sample_top5_loss_weight: 0.25
+  sample_top1_loss_weight: 0.50
+  sample_mean_loss_weight: 0.05
+  sample_top5_quantile: 0.95
+  sample_top1_quantile: 0.99
+
+scaler:
+  num_workers: 16
+  sample_seed: 42
+  prefetch_factor: 4
+  cache_path: node/cache/node_mlp_earpiece_case1000_v4_local_frf_mode_norm_80g_shuffle_scalers.pt
+  overwrite_cache: true
+  target_stats_max_values: 2000000
+
+model:
+  hidden_dims: [256, 256, 128]
+  activation: silu
+  dropout: 0.10
+  layer_norm: true
+
+training:
+  seed: 42
+  device: auto
+  epochs: 70
+  lr: 0.0005
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  batch_size: 1048576
+  sample_batch_size: 64
+  num_workers: 16
+  shuffle_samples: true
+  eval_every: 1
+  eval_progress_every_steps: 20
+  write_diagnostics: true
+  early_stopping_patience: 12
+  progress_every_steps: 20
+  init_checkpoint: node/outputs/node_mlp_earpiece_case1000_v3_peak_tail_composite/best.pt
+  allow_partial_init_checkpoint: true
+  selection_metric: composite_log_peak_tail
+  selection:
+    mode: weighted_sum
+    name: composite_log_peak_tail
+    components:
+      earpiece_stress_log_mae: 1.0
+      earpiece_stress_peak_relative_error: 0.20
+      earpiece_stress_top5_log_mae: 0.30
+      earpiece_stress_top1_log_mae: 0.20
+      earpiece_stress_miss25_rate: 0.15
+  save_dir: node/outputs/node_mlp_earpiece_case1000_v4_local_frf_mode_norm_80g_shuffle
