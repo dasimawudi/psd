@@ -1,0 +1,11 @@
+base_config: node_mlp_v6_disk_center_baseline.yaml
+
+features:
+  include_disk_center_features: false
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_disk_center_no_center_features_scalers.pt
+
+training:
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_disk_center/best.pt
+  save_dir: node/outputs/node_mlp_v6_disk_center_ablation_no_center_features
