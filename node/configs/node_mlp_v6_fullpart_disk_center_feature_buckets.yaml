@@ -1,0 +1,42 @@
+base_config: node_mlp_v6_fullpart_disk_center.yaml
+
+features:
+  include_physical_feature_buckets: true
+  physical_feature_buckets:
+    - key: frf_gain
+      source: active1_log_modal_gain_frf
+      edges: [5.1899295, 6.3628182, 6.4392533, 6.4393778]
+      labels: ["p0_50", "p50_80", "p80_95", "p95_99", "p99_100"]
+    - key: modal_weight
+      source: active1_modal_weight_frf
+      edges: [0.4, 0.7, 0.9]
+      labels: ["lt_0p40", "0p40_0p70", "0p70_0p90", "ge_0p90"]
+    - key: weighted_umag
+      source: weighted_umag_frf
+      edges: [0.38494726, 0.70544738, 0.86069734, 0.90909221]
+      labels: ["p0_50", "p50_80", "p80_95", "p95_99", "p99_100"]
+    - key: weighted_gradient
+      source: weighted_grad_umag_max_frf
+      edges: [0.0027562135, 0.0061461269, 0.012291531, 0.022630808]
+      labels: ["p0_50", "p50_80", "p80_95", "p95_99", "p99_100"]
+    - key: modal_baseline
+      source: modal_baseline_log_grad_umag_max
+      edges: [0.032028347, 0.2044909, 0.44705406, 0.71571769]
+      labels: ["p0_50", "p50_80", "p80_95", "p95_99", "p99_100"]
+    - key: center_radius
+      source: center_region_r_over_mask_radius
+      edges: [1.0, 2.0, 4.0]
+      labels: ["le_1", "1_2", "2_4", "gt_4"]
+    - key: plate_hole_edge
+      source: dist_to_plate_hole_edge_over_radius
+      edges: [0.0, 0.5, 1.0, 2.0]
+      labels: ["inside_hole", "0_0p5", "0p5_1", "1_2", "gt_2"]
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_fullpart_disk_center_feature_buckets_scalers.pt
+  overwrite_cache: true
+
+training:
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_disk_center/best.pt
+  allow_partial_init_checkpoint: true
+  save_dir: node/outputs/node_mlp_v6_fullpart_disk_center_feature_buckets

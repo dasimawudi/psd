@@ -1339,6 +1339,74 @@ def _repeat_vector(values: Sequence[float], node_count: int) -> torch.Tensor:
     return vector.unsqueeze(0).expand(node_count, -1)
 
 
+def _build_feature_bucket_one_hot(
+    *,
+    feature_groups: Sequence[tuple[torch.Tensor, list[str]]],
+    bucket_specs: Sequence[dict[str, Any]],
+) -> tuple[torch.Tensor, list[str]]:
+    feature_columns: dict[str, torch.Tensor] = {}
+    node_count: int | None = None
+    for values, names in feature_groups:
+        if values.dim() != 2 or values.size(1) != len(names):
+            raise ValueError("Feature bucket source matrix does not match its feature names.")
+        if node_count is None:
+            node_count = int(values.size(0))
+        elif int(values.size(0)) != node_count:
+            raise ValueError("Feature bucket source matrices have inconsistent point counts.")
+        for index, name in enumerate(names):
+            if name in feature_columns:
+                raise ValueError(f"Duplicate feature name while building buckets: {name}")
+            feature_columns[name] = values[:, index]
+
+    if node_count is None:
+        raise ValueError("Feature buckets require at least one source feature group.")
+
+    bucket_parts: list[torch.Tensor] = []
+    bucket_names: list[str] = []
+    seen_keys: set[str] = set()
+    for raw_spec in bucket_specs:
+        spec = dict(raw_spec)
+        key = str(spec.get("key", "")).strip()
+        source_name = str(spec.get("source", "")).strip()
+        if not key or not source_name:
+            raise ValueError("Each feature bucket spec requires non-empty key and source values.")
+        if key in seen_keys:
+            raise ValueError(f"Duplicate feature bucket key: {key}")
+        seen_keys.add(key)
+        if source_name not in feature_columns:
+            raise ValueError(f"Feature bucket source is missing: {source_name}")
+
+        edges = [float(value) for value in spec.get("edges", [])]
+        if any(not math.isfinite(value) for value in edges):
+            raise ValueError(f"Feature bucket edges must be finite for {key}: {edges}")
+        if any(left >= right for left, right in zip(edges, edges[1:])):
+            raise ValueError(f"Feature bucket edges must be strictly increasing for {key}: {edges}")
+
+        labels = [str(label).strip() for label in spec.get("labels", [])]
+        bucket_count = len(edges) + 1
+        if len(labels) != bucket_count or any(not label for label in labels):
+            raise ValueError(
+                f"Feature bucket labels for {key} must contain exactly {bucket_count} non-empty values."
+            )
+
+        source = feature_columns[source_name]
+        boundaries = source.new_tensor(edges)
+        bucket_ids = torch.bucketize(source.contiguous(), boundaries, right=True)
+        bucket_parts.append(
+            torch.stack(
+                [(bucket_ids == bucket_id).to(dtype=torch.float32) for bucket_id in range(bucket_count)],
+                dim=-1,
+            )
+        )
+        bucket_names.extend([f"bucket_{key}_{label}" for label in labels])
+
+    if not bucket_parts:
+        return torch.empty((node_count, 0), dtype=torch.float32), []
+    if len(set(bucket_names)) != len(bucket_names):
+        raise ValueError("Feature bucket output names must be unique.")
+    return torch.cat(bucket_parts, dim=-1), bucket_names
+
+
 def _build_base_features(
     nodes_df: pd.DataFrame,
     payload: dict[str, Any],
@@ -1625,6 +1693,22 @@ def _build_base_features(
         scaled_names.extend(mode_names)
 
     scaled = torch.cat(scaled_parts, dim=-1).to(dtype=torch.float32)
+    if bool(feature_cfg.get("include_physical_feature_buckets", False)):
+        bucket_specs = feature_cfg.get("physical_feature_buckets", [])
+        if not isinstance(bucket_specs, list) or not bucket_specs:
+            raise ValueError(
+                "features.physical_feature_buckets must be a non-empty list when bucket features are enabled."
+            )
+        bucket_features, bucket_names = _build_feature_bucket_one_hot(
+            feature_groups=(
+                (geometry, geometry_names),
+                (scaled, scaled_names),
+                (masks, mask_names),
+            ),
+            bucket_specs=bucket_specs,
+        )
+        masks = torch.cat([masks, bucket_features], dim=-1)
+        mask_names.extend(bucket_names)
     return geometry, scaled, masks, geometry_names, scaled_names, mask_names
 
 
