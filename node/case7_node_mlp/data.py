@@ -113,38 +113,6 @@ STRESS_REGION_DISTANCE_FEATURE_NAMES = [
     "dist_to_ear_connection_region_over_plate_radius",
     "dist_to_nearest_stress_region_over_plate_radius",
 ]
-CENTER_MODAL_INTERACTION_SPECS = (
-    (
-        "center_couple_mask",
-        "modal_baseline_log_grad_umag_max",
-        "center_couple_mask_x_modal_baseline_log_grad_umag_max",
-    ),
-    (
-        "near_center_region_exp",
-        "modal_baseline_log_grad_umag_max",
-        "near_center_region_exp_x_modal_baseline_log_grad_umag_max",
-    ),
-    (
-        "near_center_region_exp",
-        "weighted_umag_frf",
-        "near_center_region_exp_x_weighted_umag_frf",
-    ),
-    (
-        "near_center_region_exp",
-        "weighted_grad_umag_max_frf",
-        "near_center_region_exp_x_weighted_grad_umag_max_frf",
-    ),
-    (
-        "near_center_region_exp",
-        "active1_modal_weight_frf",
-        "near_center_region_exp_x_active1_modal_weight_frf",
-    ),
-    (
-        "near_center_region_exp",
-        "active1_log_modal_gain_frf",
-        "near_center_region_exp_x_active1_log_modal_gain_frf",
-    ),
-)
 GEOMETRY_FEATURE_NAMES = list(BASE_GEOMETRY_FEATURE_NAMES)
 MASK_FEATURE_NAMES = ["bc_mask", "near_ear_hole", "near_center_couple"]
 
@@ -1371,39 +1339,6 @@ def _repeat_vector(values: Sequence[float], node_count: int) -> torch.Tensor:
     return vector.unsqueeze(0).expand(node_count, -1)
 
 
-def _build_center_modal_interaction_features(
-    *,
-    center_couple_mask: torch.Tensor,
-    near_center_region_exp: torch.Tensor,
-    mode_features: torch.Tensor,
-    mode_names: list[str],
-) -> tuple[torch.Tensor, list[str]]:
-    mode_indices = {name: idx for idx, name in enumerate(mode_names)}
-    missing = sorted(
-        {
-            source_name
-            for _, source_name, _ in CENTER_MODAL_INTERACTION_SPECS
-            if source_name not in mode_indices
-        }
-    )
-    if missing:
-        raise ValueError(
-            "Center-modal interaction features require missing modal features: "
-            f"{missing}"
-        )
-
-    gates = {
-        "center_couple_mask": center_couple_mask,
-        "near_center_region_exp": near_center_region_exp,
-    }
-    parts = [
-        gates[gate_name] * mode_features[:, mode_indices[source_name] : mode_indices[source_name] + 1]
-        for gate_name, source_name, _ in CENTER_MODAL_INTERACTION_SPECS
-    ]
-    names = [output_name for _, _, output_name in CENTER_MODAL_INTERACTION_SPECS]
-    return torch.cat(parts, dim=-1).to(dtype=torch.float32), names
-
-
 def _build_base_features(
     nodes_df: pd.DataFrame,
     payload: dict[str, Any],
@@ -1470,7 +1405,6 @@ def _build_base_features(
         center_couple_signed,
     ]
     geometry_names = list(BASE_GEOMETRY_FEATURE_NAMES)
-    near_center_region_exp: torch.Tensor | None = None
 
     if bool(feature_cfg.get("include_disk_center_features", False)):
         center_mask_radius = torch.tensor(_center_couple_mask_radius(payload), dtype=torch.float32).clamp_min(1e-6)
@@ -1689,28 +1623,6 @@ def _build_base_features(
     if mode_names:
         scaled_parts.append(mode_features)
         scaled_names.extend(mode_names)
-
-    if bool(feature_cfg.get("include_center_modal_interaction_features", False)):
-        if near_center_region_exp is None:
-            raise ValueError(
-                "Center-modal interaction features require features.include_disk_center_features=true."
-            )
-        if "center_couple_mask" not in nodes_df.columns:
-            raise ValueError(
-                "Center-modal interaction features require center_couple_mask in nodes.csv."
-            )
-        center_couple_mask = torch.tensor(
-            nodes_df["center_couple_mask"].to_numpy(dtype=np.float32),
-            dtype=torch.float32,
-        )[selected_indices].unsqueeze(-1).clamp(0.0, 1.0)
-        interaction_features, interaction_names = _build_center_modal_interaction_features(
-            center_couple_mask=center_couple_mask,
-            near_center_region_exp=near_center_region_exp,
-            mode_features=mode_features,
-            mode_names=mode_names,
-        )
-        scaled_parts.append(interaction_features)
-        scaled_names.extend(interaction_names)
 
     scaled = torch.cat(scaled_parts, dim=-1).to(dtype=torch.float32)
     return geometry, scaled, masks, geometry_names, scaled_names, mask_names
