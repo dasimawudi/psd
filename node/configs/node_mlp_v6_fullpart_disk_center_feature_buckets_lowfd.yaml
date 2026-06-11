@@ -1,0 +1,6 @@
+base_config: node_mlp_v6_fullpart_disk_center_feature_buckets.yaml
+
+training:
+  num_workers: 2
+  persistent_workers: false
+  prefetch_factor: 1
