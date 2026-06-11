@@ -26,6 +26,7 @@ from case7_node_mlp.data import (
     resolve_case_splits,
 )
 from case7_node_mlp.runtime import ensure_dir, make_logger, read_config, resolve_device, write_json
+from case7_node_mlp.models import regression_output
 from case7_node_mlp.trainer import _apply_target_floor, _decode_prediction, _resolve_threshold_from_config, prepare_point_sample
 from case7_node_mlp.trace_node_frequency_response import (
     _load_model,
@@ -574,7 +575,7 @@ def _predict_case_response_points(
         with torch.no_grad():
             for start in range(0, prepared.num_points, point_batch_size):
                 stop = min(start + point_batch_size, prepared.num_points)
-                prediction_scaled = model(prepared.features[start:stop].to(device))
+                prediction_scaled = regression_output(model(prepared.features[start:stop].to(device)))
                 pred_log_t, pred_raw_t = _decode_prediction(prediction_scaled, y_scaler)
                 pred_log_chunks.append(pred_log_t.detach().cpu().reshape(-1))
                 pred_raw_chunks.append(pred_raw_t.detach().cpu().reshape(-1))

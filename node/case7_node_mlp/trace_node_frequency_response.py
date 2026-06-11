@@ -28,10 +28,10 @@ from case7_node_mlp.data import (
     resolve_case_splits,
 )
 from case7_node_mlp.evaluate import _load_checkpoint
-from case7_node_mlp.models import PointMLP
+from case7_node_mlp.models import PointMLP, regression_output
 from case7_node_mlp.runtime import ensure_dir, make_logger, read_config, resolve_device, write_json
 from case7_node_mlp.scalers import StandardScaler
-from case7_node_mlp.trainer import _decode_prediction, prepare_point_sample
+from case7_node_mlp.trainer import _decode_prediction, build_model, prepare_point_sample
 
 
 TRACE_FIELDNAMES = [
@@ -84,13 +84,7 @@ def _load_model(checkpoint: dict[str, Any], config: dict[str, Any], device: torc
     feature_schema = dict(checkpoint["feature_schema"])
     x_scaler = StandardScaler.from_state_dict(checkpoint["x_scaler"])
     y_scaler = StandardScaler.from_state_dict(checkpoint["y_scaler"])
-    model = PointMLP(
-        input_dim=int(feature_schema["input_dim"]),
-        hidden_dims=[int(dim) for dim in config.get("model", {}).get("hidden_dims", [256, 256, 128])],
-        dropout=float(config.get("model", {}).get("dropout", 0.0)),
-        activation=str(config.get("model", {}).get("activation", "silu")),
-        use_layer_norm=bool(config.get("model", {}).get("layer_norm", True)),
-    ).to(device)
+    model = build_model(config, input_dim=int(feature_schema["input_dim"]), feature_schema=feature_schema).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, x_scaler, y_scaler, feature_schema
@@ -280,7 +274,7 @@ def _predict_sample(
     row_index = int(torch.nonzero(matches, as_tuple=False)[0].item())
     feature = prepared.features[row_index : row_index + 1].to(device)
     with torch.no_grad():
-        prediction_scaled = model(feature)
+        prediction_scaled = regression_output(model(feature))
         pred_log_t, pred_raw_t = _decode_prediction(prediction_scaled, y_scaler)
     target_raw = float(prepared.target_raw[row_index].item())
     pred_raw = float(pred_raw_t.item())

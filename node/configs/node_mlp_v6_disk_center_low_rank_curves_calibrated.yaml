@@ -1,0 +1,24 @@
+base_config: node_mlp_v6_disk_center_low_rank_curves.yaml
+
+loss:
+  disk_center_peak_loss_weight: 0.35
+  disk_center_top5_loss_weight: 0.30
+  disk_center_top1_loss_weight: 0.55
+  disk_center_mean_loss_weight: 0.00
+  disk_center_top5_quantile: 0.95
+  disk_center_top1_quantile: 0.99
+  disk_center_min_points: 16
+  disk_center_min_target: 1000.0
+  disk_center_top1_under_weight: 0.90
+  disk_center_top5_under_weight: 0.50
+  disk_center_under_margin_log: 0.09531018
+  center_curve_consistency_weight: 0.02
+  center_curve_consistency_min_frequencies: 3
+  center_curve_consistency_min_points: 8
+  center_curve_consistency_top_fraction: 0.05
+  center_curve_consistency_max_nodes: 128
+
+training:
+  init_checkpoint: node/outputs/node_mlp_v6_disk_center_hotspot_features/best.pt
+  allow_partial_init_checkpoint: true
+  save_dir: node/outputs/node_mlp_v6_disk_center_low_rank_curves_calibrated

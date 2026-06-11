@@ -277,6 +277,64 @@ else:
 - 如果某些 case 的中心节点确实存在不同局部模态参与，过强 factorization 会欠拟合。
 - 需要保留 residual，并用验证集曲线图确认没有把真实差异抹平。
 
+### 5.4 第四阶段：有限曲线族 / low-rank curve-family head
+
+进一步观察后，中心区域并不一定只有一条公共频响曲线。更稳妥的假设是：
+
+```text
+同一 case 的中心区域频率-应力曲线由有限个走势族组成。
+```
+
+rank-1 的 `common_response × node_scale` 只是该假设的特例。更一般的形式是：
+
+```text
+log_stress_i(f) ≈ bias_i(case)
+                + Σ_k w_i,k(case) * G_k(case, f)
+                + residual_i(case, f)
+```
+
+其中：
+
+- `G_k(case, f)`：第 `k` 个典型频率响应走势，主要由频率、PSD、模态频率、FRF 放大等 case-frequency 特征决定。
+- `w_i,k(case)`：节点对不同曲线走势族的参与权重，主要由节点几何、中心区域位置、mode shape、modal gradient 等空间特征决定。
+- `bias_i(case)`：节点整体幅值倍率，用于表达热点 patch 的稳定放大倍数。
+- `residual_i(case, f)`：小残差项，处理模态交叉、局部异常和 Mises 非线性带来的非低秩部分。
+
+该形式有更直接的理论支撑：
+
+- 结构动力学的模态叠加认为动态应力响应可以由有限 normal mode stresses 叠加。
+- POD/SVD 降阶方法把空间-频率响应矩阵分解为少量主模态和对应响应系数。
+- 频响分析中的 low-rank approximation 说明频域响应矩阵可以存在有效低秩近似。
+- DeepONet / low-rank neural operator 的 branch-trunk 结构，本质也是有限基函数和系数的乘积组合。
+
+因此，中心区域更适合从 point-wise MLP 升级为低秩曲线族结构：
+
+```text
+frequency_head(global/modal/frequency features) -> G_1...G_K
+node_mixing_head(node geometry/modal shape features) -> w_1...w_K
+node_scale_head(node geometry/hotspot features) -> bias_i
+residual_head(all features) -> small residual
+
+pred_log = bias_i + Σ_k w_i,k * G_k + λ * residual
+```
+
+推荐初始配置：
+
+```yaml
+model:
+  low_rank_curve_head: true
+  center_curve_rank: 3
+  center_residual_weight: 0.10
+```
+
+注意事项：
+
+- 不应强行假设 rank-1；先用 SVD/PCA 诊断确认 rank-1/2/3/5 的解释率。
+- `frequency_head` 不应使用 node id、case id 查表，只能使用可泛化的全局/频率/模态/FRF 特征。
+- `node_mixing_head` 不应使用 target 派生信息，只能使用节点空间和模态形状特征。
+- `residual_weight` 初始取小值，避免低秩结构被普通 point-wise residual 完全覆盖。
+- top1/top5 的幅值校准仍需要 peak underprediction loss；low-rank 结构解决“曲线走势族和空间参与”，不自动解决“峰值倍率偏低”。
+
 ## 6. 实验计划
 
 ### 6.1 实验 0：固定基线
@@ -386,6 +444,119 @@ loss:
 - soft factorization：`common + scale + 0.1 * residual`
 
 优先采用 soft factorization。
+
+### 6.6 实验 5：有限曲线族低秩诊断与 rank-K head
+
+实验 5 分三步，对应当前分支 `feature/node-mlp-center-low-rank-curves` 的验证 1、2、3。
+
+#### 验证 1：中心区域 target 曲线低秩诊断
+
+目的：先验证“有限曲线走势”是否是数据事实，而不是直接改模型。
+
+对每个 case 构造：
+
+```text
+Y[node, freq] = log1p(target)
+```
+
+然后对 `Y` 做去均值 SVD，报告：
+
+- rank-1 / rank-2 / rank-3 / rank-5 / rank-10 解释率；
+- 同 case 中心节点去均值曲线的 pairwise correlation；
+- top1/top5 节点在第一主成分权重上的分布；
+- 中心点型和外环型 case 的差异。
+
+命令：
+
+```bash
+PYTHONPATH=node conda run -n ci2n python node/center_curve_low_rank_diagnostics.py \
+  --config node/configs/node_mlp_v6_disk_center_hotspot_features.yaml \
+  --split test \
+  --num-cases 32 \
+  --output-dir node/outputs/node_mlp_v6_disk_center_low_rank_diagnostics
+```
+
+判断标准：
+
+- 如果 rank-3 或 rank-5 解释率明显高，说明 finite curve-family 假设成立。
+- 如果 rank-1 很高，说明原 `common_response × node_scale` 已足够。
+- 如果 rank-3/rank-5 仍低，说明中心区域曲线族不是主要瓶颈，应继续优先做 peak calibration 或数据分桶。
+
+#### 验证 2：只开 rank-K center head
+
+目的：验证结构归纳偏置本身是否有收益。
+
+配置：
+
+```text
+node/configs/node_mlp_v6_disk_center_low_rank_curves.yaml
+```
+
+该配置：
+
+- 继承 hotspot feature 配置；
+- 开启 `low_rank_curve_head: true`；
+- 使用 `center_curve_rank: 3`；
+- 使用 `center_residual_weight: 0.10`；
+- 从 `node/outputs/node_mlp_v6_disk_center_hotspot_features/best.pt` 部分初始化。
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 PYTHONPATH=node conda run -n ci2n python node/train_node_mlp.py \
+  --config node/configs/node_mlp_v6_disk_center_low_rank_curves.yaml
+```
+
+#### 验证 3：rank-K head + peak calibration + 弱曲线一致性
+
+目的：同时验证结构低秩和峰值幅值校准。
+
+配置：
+
+```text
+node/configs/node_mlp_v6_disk_center_low_rank_curves_calibrated.yaml
+```
+
+相对验证 2 增加：
+
+```yaml
+loss:
+  disk_center_peak_loss_weight: 0.35
+  disk_center_top5_loss_weight: 0.30
+  disk_center_top1_loss_weight: 0.55
+  disk_center_top1_under_weight: 0.90
+  disk_center_top5_under_weight: 0.50
+  disk_center_under_margin_log: 0.09531018
+  center_curve_consistency_weight: 0.02
+```
+
+该实验默认和验证 2 并行对照，仍从 hotspot feature checkpoint 初始化，而不是等待验证 2 的 best checkpoint：
+
+```yaml
+training:
+  init_checkpoint: node/outputs/node_mlp_v6_disk_center_hotspot_features/best.pt
+```
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 PYTHONPATH=node conda run -n ci2n python node/train_node_mlp.py \
+  --config node/configs/node_mlp_v6_disk_center_low_rank_curves_calibrated.yaml
+```
+
+验收重点：
+
+- `disk_center_stress_top1_within25_ratio`
+- `disk_center_stress_top5_within25_ratio`
+- `disk_center_stress_top1_pred_target_ratio`
+- `disk_center_stress_top5_pred_target_ratio`
+- 曲线诊断中的 `log_curve_corr` 和 `peak_frequency_delta_hz`
+
+预期解释：
+
+- 如果验证 2 提升曲线相关但 within25 不明显，说明结构有效但峰值倍率仍不足。
+- 如果验证 3 明显提升 top1/top5 pred/target 和 within25，说明问题需要“低秩曲线族 + 幅值校准”同时处理。
+- 如果验证 3 牺牲普通区域指标过多，应降低 `center_curve_consistency_weight` 或 `disk_center_top1_under_weight`。
 
 ## 7. 泛化能力控制
 

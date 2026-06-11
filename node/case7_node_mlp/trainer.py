@@ -29,7 +29,7 @@ from case7_node_mlp.data import (
     load_raw_point_sample,
     resolve_case_splits,
 )
-from case7_node_mlp.models import PointMLP
+from case7_node_mlp.models import PointMLP, regression_output
 from case7_node_mlp.runtime import ensure_dir, make_logger, write_json, write_yaml
 from case7_node_mlp.scalers import RunningTensorStats, StandardScaler
 
@@ -530,6 +530,16 @@ def _scaled_to_log(tensor: torch.Tensor, y_scaler: StandardScaler) -> torch.Tens
     return tensor * std + mean
 
 
+def _case_group_tensor(case_names: list[str], device: torch.device) -> torch.Tensor:
+    case_to_id: dict[str, int] = {}
+    ids: list[int] = []
+    for case_name in case_names:
+        if case_name not in case_to_id:
+            case_to_id[case_name] = len(case_to_id)
+        ids.append(case_to_id[case_name])
+    return torch.tensor(ids, dtype=torch.long, device=device)
+
+
 def _compute_background_false_peak_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -907,6 +917,158 @@ def _compute_disk_center_tail_aux_loss(
     if not losses:
         return prediction.new_zeros(())
     return torch.stack(losses).mean()
+
+
+def _compute_disk_center_underprediction_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_raw: torch.Tensor,
+    sample_index: torch.Tensor,
+    region_mask: torch.Tensor | None,
+    loss_cfg: dict[str, Any],
+    y_scaler: StandardScaler,
+) -> torch.Tensor:
+    top5_weight = float(loss_cfg.get("disk_center_top5_under_weight", 0.0))
+    top1_weight = float(loss_cfg.get("disk_center_top1_under_weight", 0.0))
+    if top5_weight <= 0.0 and top1_weight <= 0.0:
+        return prediction.new_zeros(())
+    if region_mask is None:
+        return prediction.new_zeros(())
+
+    pred_log = _scaled_to_log(prediction, y_scaler).reshape(-1)
+    target_log = _scaled_to_log(target, y_scaler).reshape(-1)
+    target_raw_flat = target_raw.reshape(-1)
+    sample_index = sample_index.reshape(-1)
+    region_mask = region_mask.to(dtype=torch.bool, device=prediction.device).reshape(-1)
+    if not bool(region_mask.any()):
+        return prediction.new_zeros(())
+
+    top5_quantile = float(
+        loss_cfg.get(
+            "disk_center_under_top5_quantile",
+            loss_cfg.get("disk_center_top5_quantile", loss_cfg.get("sample_top5_quantile", 0.95)),
+        )
+    )
+    top1_quantile = float(
+        loss_cfg.get(
+            "disk_center_under_top1_quantile",
+            loss_cfg.get("disk_center_top1_quantile", loss_cfg.get("sample_top1_quantile", 0.99)),
+        )
+    )
+    min_points = max(1, int(loss_cfg.get("disk_center_min_points", 1)))
+    min_target = float(loss_cfg.get("disk_center_min_target", 0.0))
+    margin_log = float(loss_cfg.get("disk_center_under_margin_log", math.log(1.10)))
+
+    losses: list[torch.Tensor] = []
+    for sample_id in torch.unique(sample_index):
+        mask = (sample_index == sample_id) & region_mask
+        if int(mask.sum().item()) < min_points:
+            continue
+        sample_target_raw = target_raw_flat[mask]
+        sample_pred_log = pred_log[mask]
+        sample_target_log = target_log[mask]
+
+        sample_losses: list[torch.Tensor] = []
+        if top5_weight > 0.0:
+            threshold = torch.quantile(sample_target_raw, min(max(top5_quantile, 0.0), 1.0))
+            top_mask = (sample_target_raw >= threshold) & (sample_target_raw > min_target)
+            if bool(top_mask.any()):
+                under_delta = (sample_target_log[top_mask] - sample_pred_log[top_mask] - margin_log).clamp_min(0.0)
+                if bool((under_delta > 0.0).any()):
+                    sample_losses.append(
+                        top5_weight
+                        * F.smooth_l1_loss(under_delta, torch.zeros_like(under_delta), reduction="mean")
+                    )
+        if top1_weight > 0.0:
+            threshold = torch.quantile(sample_target_raw, min(max(top1_quantile, 0.0), 1.0))
+            top_mask = (sample_target_raw >= threshold) & (sample_target_raw > min_target)
+            if bool(top_mask.any()):
+                under_delta = (sample_target_log[top_mask] - sample_pred_log[top_mask] - margin_log).clamp_min(0.0)
+                if bool((under_delta > 0.0).any()):
+                    sample_losses.append(
+                        top1_weight
+                        * F.smooth_l1_loss(under_delta, torch.zeros_like(under_delta), reduction="mean")
+                    )
+
+        if sample_losses:
+            losses.append(torch.stack(sample_losses).sum())
+
+    if not losses:
+        return prediction.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def _compute_center_curve_consistency_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    sample_index: torch.Tensor,
+    node_indices: torch.Tensor,
+    case_group: torch.Tensor,
+    region_mask: torch.Tensor | None,
+    loss_cfg: dict[str, Any],
+    y_scaler: StandardScaler,
+) -> torch.Tensor:
+    weight = float(loss_cfg.get("center_curve_consistency_weight", 0.0))
+    if weight <= 0.0:
+        return prediction.new_zeros(())
+    if region_mask is None:
+        return prediction.new_zeros(())
+
+    min_points = max(2, int(loss_cfg.get("center_curve_consistency_min_points", 8)))
+    min_frequencies = max(2, int(loss_cfg.get("center_curve_consistency_min_frequencies", 3)))
+    top_fraction = float(loss_cfg.get("center_curve_consistency_top_fraction", 0.05))
+    pred_log = _scaled_to_log(prediction, y_scaler).reshape(-1)
+    target_log = _scaled_to_log(target, y_scaler).reshape(-1)
+    sample_index = sample_index.reshape(-1)
+    node_indices = node_indices.reshape(-1)
+    region_mask = region_mask.to(dtype=torch.bool, device=prediction.device).reshape(-1)
+    point_case_group = case_group[sample_index].reshape(-1)
+    max_nodes = max(1, int(loss_cfg.get("center_curve_consistency_max_nodes", 128)))
+    losses: list[torch.Tensor] = []
+
+    for case_id in torch.unique(point_case_group):
+        case_mask = (point_case_group == case_id) & region_mask
+        if not bool(case_mask.any()):
+            continue
+        sample_ids = torch.unique(sample_index[case_mask])
+        if int(sample_ids.numel()) < min_frequencies:
+            continue
+        top_count = max(min_points, int(math.ceil(int(case_mask.sum().item()) * top_fraction)))
+        top_count = min(top_count, int(case_mask.sum().item()))
+        top_positions = torch.nonzero(case_mask, as_tuple=False).reshape(-1)[
+            torch.topk(target_log[case_mask], k=top_count, largest=True).indices
+        ]
+        candidate_nodes = torch.unique(node_indices[top_positions])
+        if int(candidate_nodes.numel()) > max_nodes:
+            node_scores = []
+            for node_id in candidate_nodes:
+                node_mask = case_mask & (node_indices == node_id)
+                node_scores.append(target_log[node_mask].max())
+            score_tensor = torch.stack(node_scores)
+            candidate_nodes = candidate_nodes[torch.topk(score_tensor, k=max_nodes, largest=True).indices]
+
+        node_curve_losses: list[torch.Tensor] = []
+        for node_id in candidate_nodes:
+            node_mask = case_mask & (node_indices == node_id)
+            if int(node_mask.sum().item()) < min_frequencies:
+                continue
+            order = torch.argsort(sample_index[node_mask])
+            node_positions = torch.nonzero(node_mask, as_tuple=False).reshape(-1)[order]
+            if int(node_positions.numel()) < min_frequencies:
+                continue
+            node_curve_losses.append(
+                F.smooth_l1_loss(
+                    pred_log[node_positions] - pred_log[node_positions].mean(),
+                    target_log[node_positions] - target_log[node_positions].mean(),
+                    reduction="mean",
+                )
+            )
+        if node_curve_losses:
+            losses.append(torch.stack(node_curve_losses).mean())
+
+    if not losses:
+        return prediction.new_zeros(())
+    return weight * torch.stack(losses).mean()
 
 
 def prepare_point_sample(
@@ -1404,14 +1566,136 @@ def make_loader(
     )
 
 
-def build_model(config: dict[str, Any], input_dim: int) -> PointMLP:
+def _feature_indices_matching(
+    feature_names: list[str],
+    *,
+    include_patterns: list[str],
+    exclude_patterns: list[str] | None = None,
+) -> list[int]:
+    excludes = [str(item) for item in (exclude_patterns or [])]
+    includes = [str(item) for item in include_patterns]
+    indices: list[int] = []
+    for index, name in enumerate(feature_names):
+        if includes and not any(pattern in name for pattern in includes):
+            continue
+        if excludes and any(pattern in name for pattern in excludes):
+            continue
+        indices.append(index)
+    return indices
+
+
+def _low_rank_feature_indices(model_cfg: dict[str, Any], feature_schema: dict[str, Any]) -> tuple[list[int], list[int]]:
+    feature_names = [str(name) for name in feature_schema.get("feature_names", [])]
+    if not feature_names:
+        return [], []
+    if model_cfg.get("curve_frequency_feature_indices") is not None:
+        frequency_indices = [int(index) for index in model_cfg.get("curve_frequency_feature_indices", [])]
+    else:
+        frequency_patterns = [
+            str(pattern)
+            for pattern in model_cfg.get(
+                "curve_frequency_feature_patterns",
+                [
+                    "earpiece_thickness",
+                    "earpiece_RadialDist",
+                    "earpiece_TopWidth",
+                    "earpiece_HoleTopDist",
+                    "earpiece_TopFilletRadius",
+                    "earpiece_BottomFilletRadius",
+                    "plate_radius",
+                    "Add_mass",
+                    "plate_thickness",
+                    "earpiece_HoleRadius",
+                    "mass_couple_radius",
+                    "psd_",
+                    "psd_value_at_frequency",
+                    "log_psd_value_at_frequency",
+                    "frequency",
+                    "log_frequency",
+                    "freq_top",
+                    "signed_delta_to_mode",
+                    "abs_delta_to_mode",
+                    "nearest_delta",
+                    "first_mode_ratio",
+                    "freq_ratio_mode_",
+                    "modal_detuning_mode_",
+                    "log_modal_amp_",
+                    "modal_weight_",
+                    "nearest_log_modal_amp_",
+                    "sum_log_modal_amp_",
+                    "top3_log_modal_amp_sum_",
+                    "nearest_modal_weight_",
+                    "log_modal_gain_frf",
+                    "modal_weight_frf",
+                    "freq_ratio_frf",
+                ],
+            )
+        ]
+        frequency_indices = _feature_indices_matching(feature_names, include_patterns=frequency_patterns)
+
+    if model_cfg.get("curve_node_feature_indices") is not None:
+        node_indices = [int(index) for index in model_cfg.get("curve_node_feature_indices", [])]
+    else:
+        node_patterns = [
+            str(pattern)
+            for pattern in model_cfg.get(
+                "curve_node_feature_patterns",
+                [
+                    "_norm",
+                    "dist_to_",
+                    "sin_theta",
+                    "cos_theta",
+                    "center_",
+                    "near_",
+                    "weighted_abs_",
+                    "weighted_umag",
+                    "nearest_abs_",
+                    "nearest_umag",
+                    "weighted_grad_",
+                    "nearest_grad_",
+                    "active1_abs_",
+                    "active2_abs_",
+                    "active3_abs_",
+                    "active1_umag",
+                    "active2_umag",
+                    "active3_umag",
+                    "active1_grad_",
+                    "active2_grad_",
+                    "active3_grad_",
+                    "modal_baseline_log_",
+                    "shape_rms",
+                    "mask",
+                    "stress_region_mask",
+                ],
+            )
+        ]
+        node_indices = _feature_indices_matching(feature_names, include_patterns=node_patterns)
+
+    if not frequency_indices:
+        frequency_indices = list(range(len(feature_names)))
+    if not node_indices:
+        node_indices = list(range(len(feature_names)))
+    return frequency_indices, node_indices
+
+
+def build_model(config: dict[str, Any], input_dim: int, feature_schema: dict[str, Any] | None = None) -> PointMLP:
     model_cfg = dict(config.get("model", {}))
+    low_rank_enabled = bool(model_cfg.get("low_rank_curve_head", False))
+    frequency_indices: list[int] = []
+    node_indices: list[int] = []
+    if low_rank_enabled:
+        frequency_indices, node_indices = _low_rank_feature_indices(model_cfg, feature_schema or {})
     return PointMLP(
         input_dim=input_dim,
         hidden_dims=[int(dim) for dim in model_cfg.get("hidden_dims", [256, 256, 128])],
         dropout=float(model_cfg.get("dropout", 0.1)),
         activation=str(model_cfg.get("activation", "silu")),
         use_layer_norm=bool(model_cfg.get("layer_norm", True)),
+        low_rank_curve_head=low_rank_enabled,
+        curve_rank=int(model_cfg.get("center_curve_rank", model_cfg.get("curve_rank", 3))),
+        frequency_feature_indices=frequency_indices,
+        node_feature_indices=node_indices,
+        residual_weight=float(model_cfg.get("center_residual_weight", model_cfg.get("residual_weight", 0.1))),
     )
 
 
@@ -1441,7 +1725,7 @@ def _load_checkpoint_for_feature_schema_change(
             adapted_state[name].copy_(tensor)
             copied += 1
             continue
-        if name == "network.0.weight" and tensor.dim() == 2 and adapted_state[name].dim() == 2:
+        if name == "network.0.weight" and name in adapted_state and tensor.dim() == 2 and adapted_state[name].dim() == 2:
             shared_names = [feature for feature in current_feature_names if feature in old_index]
             if shared_names:
                 for feature in shared_names:
@@ -1506,16 +1790,18 @@ def train_one_epoch(
             target = host_batch.target_scaled[chunk].to(device, non_blocking=True)
             weights = host_batch.point_weights[chunk].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            prediction = model(features)
+            output = model(features)
+            prediction = regression_output(output)
             loss_values = F.smooth_l1_loss(prediction, target, reduction="none").squeeze(-1)
             loss = (loss_values * weights).sum() / weights.sum().clamp_min(1e-12)
             if loss_cfg:
                 target_raw_chunk = host_batch.target_raw[chunk].to(device, non_blocking=True)
+                sample_index_chunk = host_batch.sample_index[chunk].to(device, non_blocking=True)
                 aux_loss = _compute_sample_tail_aux_loss(
                     prediction=prediction,
                     target=target,
                     target_raw=target_raw_chunk,
-                    sample_index=host_batch.sample_index[chunk].to(device, non_blocking=True),
+                    sample_index=sample_index_chunk,
                     loss_cfg=loss_cfg,
                 )
                 disk_center_region_mask = (
@@ -1531,6 +1817,25 @@ def train_one_epoch(
                     region_mask=disk_center_region_mask,
                     loss_cfg=loss_cfg,
                 )
+                aux_loss = aux_loss + _compute_disk_center_underprediction_loss(
+                    prediction=prediction,
+                    target=target,
+                    target_raw=target_raw_chunk,
+                    sample_index=sample_index_chunk,
+                    region_mask=disk_center_region_mask,
+                    loss_cfg=loss_cfg,
+                    y_scaler=y_scaler,
+                )
+                aux_loss = aux_loss + _compute_center_curve_consistency_loss(
+                    prediction=prediction,
+                    target=target,
+                    sample_index=sample_index_chunk,
+                    node_indices=host_batch.node_indices[chunk].to(device, non_blocking=True),
+                    case_group=_case_group_tensor(host_batch.case_names, device),
+                    region_mask=disk_center_region_mask,
+                    loss_cfg=loss_cfg,
+                    y_scaler=y_scaler,
+                )
                 low_target_loss = _compute_low_target_overprediction_loss(
                     prediction=prediction,
                     target=target,
@@ -1538,7 +1843,6 @@ def train_one_epoch(
                     loss_cfg=loss_cfg,
                 )
                 rank_loss = prediction.new_zeros(())
-                sample_index_chunk = host_batch.sample_index[chunk].to(device, non_blocking=True)
                 rank_loss = (
                     rank_loss
                     + _compute_rank_band_balanced_loss(
@@ -1661,7 +1965,7 @@ def evaluate(
             predictions_scaled = []
             for chunk in _point_chunks(host_batch, point_batch_size=point_batch_size, shuffle=False):
                 features = host_batch.features[chunk].to(device, non_blocking=True)
-                predictions_scaled.append(model(features).detach().cpu())
+                predictions_scaled.append(regression_output(model(features)).detach().cpu())
             prediction_scaled_cpu = torch.cat(predictions_scaled, dim=0)
             target_scaled_cpu = host_batch.target_scaled
             loss = F.smooth_l1_loss(prediction_scaled_cpu, target_scaled_cpu, reduction="sum").item()
@@ -2086,7 +2390,7 @@ class NodeMLPTrainer:
                         scaler_cache_path,
                     )
         input_dim = int(self.feature_schema["input_dim"])
-        self.model = build_model(self.config, input_dim=input_dim).to(self.device)
+        self.model = build_model(self.config, input_dim=input_dim, feature_schema=self.feature_schema).to(self.device)
         init_checkpoint = self.training_cfg.get("init_checkpoint")
         if init_checkpoint:
             checkpoint_path = Path(str(init_checkpoint))
@@ -2094,7 +2398,10 @@ class NodeMLPTrainer:
                 self.logger.info("Initializing model from checkpoint: %s", checkpoint_path)
                 checkpoint = torch.load(checkpoint_path, map_location="cpu")
                 checkpoint_schema = dict(checkpoint.get("feature_schema", {}))
-                if checkpoint_schema.get("feature_names") == self.feature_schema.get("feature_names"):
+                if (
+                    checkpoint_schema.get("feature_names") == self.feature_schema.get("feature_names")
+                    and not bool(self.training_cfg.get("allow_partial_init_checkpoint", False))
+                ):
                     self.model.load_state_dict(checkpoint["model_state"])
                 elif bool(self.training_cfg.get("allow_partial_init_checkpoint", False)):
                     init_summary = _load_checkpoint_for_feature_schema_change(

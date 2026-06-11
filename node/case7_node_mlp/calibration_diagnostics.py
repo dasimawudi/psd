@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from case7_node_mlp.data import discover_case_index, expand_case_sample_paths, resolve_case_splits
 from case7_node_mlp.evaluate import _load_checkpoint
 from case7_node_mlp.hotspot_within25_diagnostics import GroupStats, _load_model
+from case7_node_mlp.models import regression_output
 from case7_node_mlp.runtime import ensure_dir, make_logger, read_config, resolve_device, write_json
 from case7_node_mlp.scalers import StandardScaler
 from case7_node_mlp.trainer import _decode_prediction, make_loader
@@ -180,7 +181,7 @@ def _collect_predictions(
             for start in range(0, host_batch.num_points, point_batch_size):
                 end = min(start + point_batch_size, host_batch.num_points)
                 features = host_batch.features[start:end].to(device, non_blocking=True)
-                predictions_scaled.append(model(features).detach().cpu())
+                predictions_scaled.append(regression_output(model(features)).detach().cpu())
             prediction_scaled = torch.cat(predictions_scaled, dim=0)
             pred_log_t, pred_raw_t = _decode_prediction(prediction_scaled.to(device), y_scaler)
             pred_log = pred_log_t.cpu().numpy().astype(np.float32, copy=False)

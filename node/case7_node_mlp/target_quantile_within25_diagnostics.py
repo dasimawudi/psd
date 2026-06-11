@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 from case7_node_mlp.data import discover_case_index, expand_case_sample_paths, resolve_case_splits
 from case7_node_mlp.evaluate import _load_checkpoint
 from case7_node_mlp.models import PointMLP
+from case7_node_mlp.models import regression_output
+from case7_node_mlp.trainer import build_model
 from case7_node_mlp.runtime import ensure_dir, make_logger, read_config, resolve_device, write_json
 from case7_node_mlp.scalers import StandardScaler
 from case7_node_mlp.trainer import _decode_prediction, _load_target_values_for_stats, make_loader
@@ -261,14 +263,7 @@ def _estimate_quantile_thresholds(
 
 def _load_model(checkpoint: dict[str, Any], config: dict[str, Any], device: torch.device) -> PointMLP:
     feature_schema = dict(checkpoint["feature_schema"])
-    model_cfg = dict(config.get("model", {}))
-    model = PointMLP(
-        input_dim=int(feature_schema["input_dim"]),
-        hidden_dims=[int(dim) for dim in model_cfg.get("hidden_dims", [256, 256, 128])],
-        dropout=float(model_cfg.get("dropout", 0.0)),
-        activation=str(model_cfg.get("activation", "silu")),
-        use_layer_norm=bool(model_cfg.get("layer_norm", True)),
-    ).to(device)
+    model = build_model(config, input_dim=int(feature_schema["input_dim"]), feature_schema=feature_schema).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model
@@ -434,7 +429,7 @@ def main() -> None:
             for start in range(0, host_batch.num_points, point_batch_size):
                 stop = min(start + point_batch_size, host_batch.num_points)
                 features = host_batch.features[start:stop].to(device, non_blocking=True)
-                predictions_scaled.append(model(features).detach().cpu())
+                predictions_scaled.append(regression_output(model(features)).detach().cpu())
             prediction_scaled = torch.cat(predictions_scaled, dim=0)
             pred_log_t, pred_raw_t = _decode_prediction(prediction_scaled.to(device), y_scaler)
             pred_log = pred_log_t.cpu().numpy().astype(np.float64, copy=False)
