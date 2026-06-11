@@ -94,6 +94,11 @@ DISK_CENTER_FEATURE_NAMES = [
     "center_region_signed",
     "near_center_region_exp",
 ]
+DISK_CENTER_BAND_FEATURE_NAMES = [
+    "center_inner_core_soft",
+    "center_mid_ring_soft",
+    "center_outer_ring_soft",
+]
 PLATE_HOLE_FEATURE_NAMES = [
     "dist_to_plate_hole_center_over_radius",
     "dist_to_plate_hole_edge_over_radius",
@@ -321,6 +326,130 @@ def _center_couple_mask_radius(payload: dict[str, Any], default: float = 15.0) -
     if not math.isfinite(radius) or radius <= 0.0:
         radius = float(default)
     return max(radius, 1e-6)
+
+
+def _disk_center_rbf_feature_names(count: int) -> list[str]:
+    return [f"center_region_rbf_{index}" for index in range(int(count))]
+
+
+def _disk_center_modal_region_feature_names(source_name: str) -> list[str]:
+    return [
+        f"center_inner_mean_log_{source_name}",
+        f"center_outer_mean_log_{source_name}",
+        f"center_inner_max_log_{source_name}",
+        f"center_outer_max_log_{source_name}",
+        f"center_outer_minus_inner_mean_log_{source_name}",
+        f"center_outer_minus_inner_max_log_{source_name}",
+    ]
+
+
+def _build_disk_center_extra_geometry_features(
+    r: torch.Tensor,
+    center_mask_radius: torch.Tensor,
+    feature_cfg: dict[str, Any],
+) -> tuple[torch.Tensor, list[str]]:
+    parts: list[torch.Tensor] = []
+    names: list[str] = []
+    center_radius_value = float(center_mask_radius.item())
+
+    if bool(feature_cfg.get("include_disk_center_band_features", False)):
+        inner_radius_mm = max(float(feature_cfg.get("disk_center_inner_radius_mm", 3.0)), 0.0)
+        default_outer_radius = min(12.0, max(center_radius_value * 0.8, inner_radius_mm + 1e-3))
+        outer_radius_mm = float(feature_cfg.get("disk_center_outer_radius_mm", default_outer_radius))
+        outer_radius_mm = min(max(outer_radius_mm, inner_radius_mm + 1e-3), center_radius_value)
+        ring_softness_mm = max(float(feature_cfg.get("disk_center_ring_softness_mm", 1.0)), 1e-6)
+
+        inner_core_soft = torch.sigmoid((inner_radius_mm - r) / ring_softness_mm)
+        outer_ring_soft = torch.sigmoid((r - outer_radius_mm) / ring_softness_mm)
+        mid_ring_soft = (1.0 - inner_core_soft).clamp_min(0.0) * (1.0 - outer_ring_soft).clamp_min(0.0)
+        parts.extend([inner_core_soft, mid_ring_soft, outer_ring_soft])
+        names.extend(DISK_CENTER_BAND_FEATURE_NAMES)
+
+    if bool(feature_cfg.get("include_disk_center_rbf_features", False)):
+        rbf_count = max(0, int(feature_cfg.get("disk_center_rbf_count", 0)))
+        if rbf_count > 0:
+            bandwidth_ratio = max(float(feature_cfg.get("disk_center_rbf_bandwidth_ratio", 0.14)), 1e-6)
+            centers = torch.linspace(0.0, 1.0, steps=rbf_count, dtype=r.dtype, device=r.device)
+            normalized_radius = (r / center_mask_radius).clamp(0.0, 1.5)
+            rbfs = torch.exp(-0.5 * ((normalized_radius - centers.view(1, -1)) / bandwidth_ratio).pow(2))
+            parts.append(rbfs)
+            names.extend(_disk_center_rbf_feature_names(rbf_count))
+
+    if not parts:
+        return torch.empty((r.shape[0], 0), dtype=torch.float32), []
+    return torch.cat(parts, dim=-1).to(dtype=torch.float32), names
+
+
+def _masked_scalar_log_stats(values: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    flat_values = values.reshape(-1).clamp_min(0.0)
+    flat_mask = mask.reshape(-1)
+    selected = flat_values[flat_mask]
+    if selected.numel() == 0:
+        selected = flat_values
+    mean_log = torch.log1p(selected.mean().clamp_min(0.0))
+    max_log = torch.log1p(selected.max().clamp_min(0.0))
+    return mean_log, max_log
+
+
+def _build_disk_center_modal_region_features(
+    radius_mm: torch.Tensor | None,
+    center_mask_radius_mm: float | None,
+    node_scalar_features: dict[str, torch.Tensor],
+    feature_cfg: dict[str, Any],
+) -> tuple[torch.Tensor, list[str]]:
+    if not bool(feature_cfg.get("include_disk_center_modal_region_features", False)):
+        return torch.empty((0, 0), dtype=torch.float32), []
+    if radius_mm is None or center_mask_radius_mm is None:
+        return torch.empty((0, 0), dtype=torch.float32), []
+
+    radius = radius_mm.reshape(-1).to(dtype=torch.float32)
+    if radius.numel() == 0:
+        return torch.empty((0, 0), dtype=torch.float32), []
+
+    center_radius_value = max(float(center_mask_radius_mm), 1e-6)
+    inner_radius_mm = max(float(feature_cfg.get("disk_center_inner_radius_mm", 3.0)), 0.0)
+    default_outer_radius = min(12.0, max(center_radius_value * 0.8, inner_radius_mm + 1e-3))
+    outer_radius_mm = float(feature_cfg.get("disk_center_outer_radius_mm", default_outer_radius))
+    outer_radius_mm = min(max(outer_radius_mm, inner_radius_mm + 1e-3), center_radius_value)
+
+    inner_mask = radius <= inner_radius_mm
+    outer_mask = radius >= outer_radius_mm
+    if not torch.any(inner_mask):
+        inner_mask[torch.argmin(radius)] = True
+    if not torch.any(outer_mask):
+        outer_mask[torch.argmax(radius)] = True
+
+    feature_keys = feature_cfg.get(
+        "disk_center_modal_region_feature_keys",
+        ["nearest_umag", "weighted_umag_frf", "weighted_grad_umag_max_frf"],
+    )
+    parts: list[torch.Tensor] = []
+    names: list[str] = []
+    node_count = int(radius.numel())
+    for raw_key in feature_keys:
+        key = str(raw_key)
+        values = node_scalar_features.get(key)
+        if values is None or values.numel() == 0:
+            continue
+        inner_mean_log, inner_max_log = _masked_scalar_log_stats(values, inner_mask)
+        outer_mean_log, outer_max_log = _masked_scalar_log_stats(values, outer_mask)
+        summary = torch.stack(
+            [
+                inner_mean_log,
+                outer_mean_log,
+                inner_max_log,
+                outer_max_log,
+                outer_mean_log - inner_mean_log,
+                outer_max_log - inner_max_log,
+            ],
+            dim=0,
+        ).view(1, -1)
+        parts.append(summary.expand(node_count, -1))
+        names.extend(_disk_center_modal_region_feature_names(key))
+
+    if not parts:
+        return torch.empty((node_count, 0), dtype=torch.float32), []
+    return torch.cat(parts, dim=-1).to(dtype=torch.float32), names
 
 
 def _node_mask_values(nodes_df: pd.DataFrame, column: str) -> np.ndarray:
@@ -1066,6 +1195,8 @@ def _build_mode_shape_features(
     frequency_hz: float,
     feature_cfg: dict[str, Any],
     psd_value_at_frequency: float = 0.0,
+    radius_mm: torch.Tensor | None = None,
+    center_mask_radius_mm: float | None = None,
 ) -> tuple[torch.Tensor, list[str]]:
     if not bool(feature_cfg.get("use_mode_shapes", True)):
         return torch.empty((selected_indices.numel(), 0), dtype=torch.float32), []
@@ -1099,6 +1230,10 @@ def _build_mode_shape_features(
     node_count = selected_indices.numel()
     nearest_gap = log_gap[nearest_index].view(1, 1).expand(node_count, 1)
     nearest_weight = weights[nearest_index].view(1, 1).expand(node_count, 1)
+    region_scalar_features: dict[str, torch.Tensor] = {
+        "weighted_umag": weighted_umag.squeeze(-1),
+        "nearest_umag": nearest_umag.squeeze(-1),
+    }
     features = torch.cat(
         [
             weighted_abs_xyz,
@@ -1141,6 +1276,7 @@ def _build_mode_shape_features(
         gain, frf_weights, active = get_frf_state()
         weighted_abs_xyz_frf = (abs_xyz * frf_weights.view(1, -1, 1)).sum(dim=1)
         weighted_umag_frf = (umag * frf_weights.view(1, -1, 1)).sum(dim=1)
+        region_scalar_features["weighted_umag_frf"] = weighted_umag_frf.squeeze(-1)
         features = torch.cat(
             [
                 features,
@@ -1213,6 +1349,8 @@ def _build_mode_shape_features(
             values = gradients[key][selected_indices]
             weighted = (values * frf_weights.view(1, -1)).sum(dim=1, keepdim=True)
             nearest = values[:, int(nearest_index.item())].reshape(node_count, 1)
+            region_scalar_features[f"weighted_{key}_frf"] = weighted.squeeze(-1)
+            region_scalar_features[f"nearest_{key}"] = nearest.squeeze(-1)
             feature_parts = [weighted, nearest]
             feature_names = [f"weighted_{key}_frf", f"nearest_{key}"]
             for rank, mode_idx_tensor in enumerate(active, start=1):
@@ -1293,6 +1431,16 @@ def _build_mode_shape_features(
                 ]
             )
 
+    disk_center_region_features, disk_center_region_names = _build_disk_center_modal_region_features(
+        radius_mm=radius_mm,
+        center_mask_radius_mm=center_mask_radius_mm,
+        node_scalar_features=region_scalar_features,
+        feature_cfg=feature_cfg,
+    )
+    if disk_center_region_names:
+        features = torch.cat([features, disk_center_region_features], dim=-1)
+        names.extend(disk_center_region_names)
+
     modal_response_values, modal_response_names = _build_modal_response_features(
         frequency_hz=frequency_hz,
         modal_frequencies=modal_frequencies,
@@ -1371,6 +1519,7 @@ def _build_base_features(
     plate_hole_radius = torch.tensor(float(fixed_geometry["plate_HoleRadius"]), dtype=torch.float32).clamp_min(1e-6)
     plate_hole_dist = torch.tensor(float(fixed_geometry["plate_HoleDist"]), dtype=torch.float32).clamp_min(1e-6)
     plate_hole_count = max(1, int(float(fixed_geometry["plate_HoleCount"])))
+    center_mask_radius = torch.tensor(_center_couple_mask_radius(payload), dtype=torch.float32).clamp_min(1e-6)
 
     r = torch.sqrt(x.pow(2) + y.pow(2) + 1e-12)
     theta = torch.atan2(y, x)
@@ -1407,7 +1556,6 @@ def _build_base_features(
     geometry_names = list(BASE_GEOMETRY_FEATURE_NAMES)
 
     if bool(feature_cfg.get("include_disk_center_features", False)):
-        center_mask_radius = torch.tensor(_center_couple_mask_radius(payload), dtype=torch.float32).clamp_min(1e-6)
         center_region_signed = (center_mask_radius - r) / center_mask_radius
         center_region_tau = max(float(feature_cfg.get("center_region_tau", 8.0)), 1e-6)
         near_center_region_exp = torch.exp((r - center_mask_radius).clamp_min(0.0).neg() / center_region_tau)
@@ -1419,6 +1567,14 @@ def _build_base_features(
             ]
         )
         geometry_names.extend(DISK_CENTER_FEATURE_NAMES)
+        extra_geometry, extra_geometry_names = _build_disk_center_extra_geometry_features(
+            r=r,
+            center_mask_radius=center_mask_radius,
+            feature_cfg=feature_cfg,
+        )
+        if extra_geometry_names:
+            geometry_parts.append(extra_geometry)
+            geometry_names.extend(extra_geometry_names)
 
     if bool(feature_cfg.get("include_plate_hole_features", False)):
         plate_hole_angles = torch.linspace(0.0, 2.0 * math.pi, steps=plate_hole_count + 1, dtype=torch.float32)[:-1]
@@ -1619,6 +1775,8 @@ def _build_base_features(
         frequency_hz=frequency_hz,
         feature_cfg=feature_cfg,
         psd_value_at_frequency=psd_at_frequency,
+        radius_mm=r.squeeze(-1),
+        center_mask_radius_mm=float(center_mask_radius.item()),
     )
     if mode_names:
         scaled_parts.append(mode_features)
