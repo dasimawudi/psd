@@ -11,10 +11,10 @@ import torch
 
 from case7_node_mlp.data import discover_case_index, expand_case_sample_paths, resolve_case_splits
 from case7_node_mlp.evaluate import _load_checkpoint
-from case7_node_mlp.models import PointMLP
+from case7_node_mlp.models import PointMLP, regression_output
 from case7_node_mlp.runtime import ensure_dir, make_logger, read_config, resolve_device, write_json
 from case7_node_mlp.scalers import StandardScaler
-from case7_node_mlp.trainer import _decode_prediction, make_loader
+from case7_node_mlp.trainer import _decode_prediction, build_model, make_loader
 
 
 SUMMARY_BANDS = {
@@ -56,13 +56,7 @@ def parse_args() -> argparse.Namespace:
 
 def _load_model(checkpoint: dict[str, Any], config: dict[str, Any], device: torch.device) -> PointMLP:
     feature_schema = dict(checkpoint["feature_schema"])
-    model = PointMLP(
-        input_dim=int(feature_schema["input_dim"]),
-        hidden_dims=[int(dim) for dim in config.get("model", {}).get("hidden_dims", [256, 256, 128])],
-        dropout=float(config.get("model", {}).get("dropout", 0.0)),
-        activation=str(config.get("model", {}).get("activation", "silu")),
-        use_layer_norm=bool(config.get("model", {}).get("layer_norm", True)),
-    ).to(device)
+    model = build_model(config, input_dim=int(feature_schema["input_dim"]), feature_schema=feature_schema).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model
@@ -209,7 +203,7 @@ def main() -> None:
             pred_scaled_parts = []
             for start in range(0, batch.num_points, point_batch_size):
                 end = min(start + point_batch_size, batch.num_points)
-                pred_scaled_parts.append(model(batch.features[start:end]))
+                pred_scaled_parts.append(regression_output(model(batch.features[start:end])))
             pred_scaled = torch.cat(pred_scaled_parts, dim=0)
             _pred_log, pred_raw = _decode_prediction(pred_scaled, y_scaler)
 

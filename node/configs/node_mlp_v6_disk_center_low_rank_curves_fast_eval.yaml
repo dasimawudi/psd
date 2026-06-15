@@ -1,0 +1,10 @@
+base_config: node_mlp_v6_disk_center_low_rank_curves.yaml
+
+training:
+  save_dir: node/outputs/node_mlp_v6_disk_center_low_rank_curves_fast_eval
+  eval_topk_mode: selection
+  eval_include_region_metrics: false
+  test_on_best: false
+  final_test_after_training: true
+  final_test_topk_mode: full
+  final_test_include_region_metrics: true

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import OrderedDict
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -500,6 +501,17 @@ def _build_point_weights(
             threshold = torch.quantile(center_targets, quantile)
             peak_mask = center_mask & (target_raw.reshape(-1) >= threshold) & (target_raw.reshape(-1) > min_target)
             weights = torch.where(peak_mask, weights * center_weight, weights)
+
+    earpiece_weight = float(loss_cfg.get("earpiece_region_point_weight", 1.0))
+    if earpiece_weight > 1.0 and region_masks is not None and "earpiece_region" in region_masks:
+        earpiece_mask = region_masks["earpiece_region"].to(dtype=torch.bool, device=target_raw.device).reshape(-1)
+        if bool(earpiece_mask.any()):
+            quantile = min(max(float(loss_cfg.get("earpiece_region_top_quantile", 0.95)), 0.0), 1.0)
+            min_target = float(loss_cfg.get("earpiece_region_min_target", 0.0))
+            earpiece_targets = target_raw.reshape(-1)[earpiece_mask]
+            threshold = torch.quantile(earpiece_targets, quantile)
+            peak_mask = earpiece_mask & (target_raw.reshape(-1) >= threshold) & (target_raw.reshape(-1) > min_target)
+            weights = torch.where(peak_mask, weights * earpiece_weight, weights)
     return weights
 
 
@@ -521,6 +533,30 @@ def _compute_low_target_overprediction_loss(
     if not bool(mask.any()):
         return prediction.new_zeros(())
     over_delta = (pred_flat[mask] - target_flat[mask]).clamp_min(0.0)
+    return weight * F.smooth_l1_loss(over_delta, torch.zeros_like(over_delta), reduction="mean")
+
+
+def _compute_censored_background_loss(
+    prediction: torch.Tensor,
+    target_raw: torch.Tensor,
+    loss_cfg: dict[str, Any],
+    y_scaler: StandardScaler,
+) -> torch.Tensor:
+    weight = float(loss_cfg.get("censored_background_weight", 0.0))
+    if weight <= 0.0:
+        return prediction.new_zeros(())
+    target_max = float(loss_cfg.get("censored_background_target_max", 100.0))
+    pred_ceiling = float(loss_cfg.get("censored_background_pred_ceiling", target_max))
+    margin_log = float(loss_cfg.get("censored_background_margin_log", 0.0))
+    pred_log = _scaled_to_log(prediction, y_scaler).reshape(-1)
+    target_raw_flat = target_raw.reshape(-1)
+    mask = (target_raw_flat >= 0.0) & (target_raw_flat <= target_max)
+    if not bool(mask.any()):
+        return prediction.new_zeros(())
+    ceiling_log = math.log1p(max(pred_ceiling, 0.0)) + margin_log
+    over_delta = (pred_log[mask] - ceiling_log).clamp_min(0.0)
+    if not bool((over_delta > 0.0).any()):
+        return prediction.new_zeros(())
     return weight * F.smooth_l1_loss(over_delta, torch.zeros_like(over_delta), reduction="mean")
 
 
@@ -919,6 +955,50 @@ def _compute_disk_center_tail_aux_loss(
     return torch.stack(losses).mean()
 
 
+def _compute_region_tail_aux_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_raw: torch.Tensor,
+    sample_index: torch.Tensor,
+    region_mask: torch.Tensor | None,
+    loss_cfg: dict[str, Any],
+    prefix: str,
+) -> torch.Tensor:
+    if prefix == "disk_center":
+        return _compute_disk_center_tail_aux_loss(
+            prediction=prediction,
+            target=target,
+            target_raw=target_raw,
+            sample_index=sample_index,
+            region_mask=region_mask,
+            loss_cfg=loss_cfg,
+        )
+
+    region_cfg = dict(loss_cfg)
+    region_cfg["disk_center_peak_loss_weight"] = loss_cfg.get(f"{prefix}_peak_loss_weight", 0.0)
+    region_cfg["disk_center_top5_loss_weight"] = loss_cfg.get(f"{prefix}_top5_loss_weight", 0.0)
+    region_cfg["disk_center_top1_loss_weight"] = loss_cfg.get(f"{prefix}_top1_loss_weight", 0.0)
+    region_cfg["disk_center_mean_loss_weight"] = loss_cfg.get(f"{prefix}_mean_loss_weight", 0.0)
+    region_cfg["disk_center_top5_quantile"] = loss_cfg.get(
+        f"{prefix}_top5_quantile",
+        loss_cfg.get("sample_top5_quantile", 0.95),
+    )
+    region_cfg["disk_center_top1_quantile"] = loss_cfg.get(
+        f"{prefix}_top1_quantile",
+        loss_cfg.get("sample_top1_quantile", 0.99),
+    )
+    region_cfg["disk_center_min_points"] = loss_cfg.get(f"{prefix}_min_points", 1)
+    region_cfg["disk_center_min_target"] = loss_cfg.get(f"{prefix}_min_target", 0.0)
+    return _compute_disk_center_tail_aux_loss(
+        prediction=prediction,
+        target=target,
+        target_raw=target_raw,
+        sample_index=sample_index,
+        region_mask=region_mask,
+        loss_cfg=region_cfg,
+    )
+
+
 def _compute_disk_center_underprediction_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -996,6 +1076,55 @@ def _compute_disk_center_underprediction_loss(
     if not losses:
         return prediction.new_zeros(())
     return torch.stack(losses).mean()
+
+
+def _compute_region_underprediction_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_raw: torch.Tensor,
+    sample_index: torch.Tensor,
+    region_mask: torch.Tensor | None,
+    loss_cfg: dict[str, Any],
+    y_scaler: StandardScaler,
+    prefix: str,
+) -> torch.Tensor:
+    if prefix == "disk_center":
+        return _compute_disk_center_underprediction_loss(
+            prediction=prediction,
+            target=target,
+            target_raw=target_raw,
+            sample_index=sample_index,
+            region_mask=region_mask,
+            loss_cfg=loss_cfg,
+            y_scaler=y_scaler,
+        )
+
+    region_cfg = dict(loss_cfg)
+    region_cfg["disk_center_top5_under_weight"] = loss_cfg.get(f"{prefix}_top5_under_weight", 0.0)
+    region_cfg["disk_center_top1_under_weight"] = loss_cfg.get(f"{prefix}_top1_under_weight", 0.0)
+    region_cfg["disk_center_under_top5_quantile"] = loss_cfg.get(
+        f"{prefix}_under_top5_quantile",
+        loss_cfg.get(f"{prefix}_top5_quantile", loss_cfg.get("sample_top5_quantile", 0.95)),
+    )
+    region_cfg["disk_center_under_top1_quantile"] = loss_cfg.get(
+        f"{prefix}_under_top1_quantile",
+        loss_cfg.get(f"{prefix}_top1_quantile", loss_cfg.get("sample_top1_quantile", 0.99)),
+    )
+    region_cfg["disk_center_min_points"] = loss_cfg.get(f"{prefix}_min_points", 1)
+    region_cfg["disk_center_min_target"] = loss_cfg.get(f"{prefix}_min_target", 0.0)
+    region_cfg["disk_center_under_margin_log"] = loss_cfg.get(
+        f"{prefix}_under_margin_log",
+        math.log(1.10),
+    )
+    return _compute_disk_center_underprediction_loss(
+        prediction=prediction,
+        target=target,
+        target_raw=target_raw,
+        sample_index=sample_index,
+        region_mask=region_mask,
+        loss_cfg=region_cfg,
+        y_scaler=y_scaler,
+    )
 
 
 def _compute_center_curve_consistency_loss(
@@ -1631,7 +1760,14 @@ def _low_rank_feature_indices(model_cfg: dict[str, Any], feature_schema: dict[st
                 ],
             )
         ]
-        frequency_indices = _feature_indices_matching(feature_names, include_patterns=frequency_patterns)
+        frequency_exclude_patterns = [
+            str(pattern) for pattern in model_cfg.get("curve_frequency_feature_exclude_patterns", [])
+        ]
+        frequency_indices = _feature_indices_matching(
+            feature_names,
+            include_patterns=frequency_patterns,
+            exclude_patterns=frequency_exclude_patterns,
+        )
 
     if model_cfg.get("curve_node_feature_indices") is not None:
         node_indices = [int(index) for index in model_cfg.get("curve_node_feature_indices", [])]
@@ -1669,7 +1805,12 @@ def _low_rank_feature_indices(model_cfg: dict[str, Any], feature_schema: dict[st
                 ],
             )
         ]
-        node_indices = _feature_indices_matching(feature_names, include_patterns=node_patterns)
+        node_exclude_patterns = [str(pattern) for pattern in model_cfg.get("curve_node_feature_exclude_patterns", [])]
+        node_indices = _feature_indices_matching(
+            feature_names,
+            include_patterns=node_patterns,
+            exclude_patterns=node_exclude_patterns,
+        )
 
     if not frequency_indices:
         frequency_indices = list(range(len(feature_names)))
@@ -1747,6 +1888,76 @@ def _load_checkpoint_for_feature_schema_change(
     }
 
 
+def _blend_first_layer_from_checkpoint(
+    model: torch.nn.Module,
+    checkpoint: dict[str, Any],
+    current_feature_schema: dict[str, Any],
+    *,
+    blend: float,
+    feature_patterns: list[str] | None = None,
+) -> dict[str, int | float]:
+    checkpoint_state = checkpoint["model_state"]
+    checkpoint_schema = dict(checkpoint.get("feature_schema", {}))
+    old_feature_names = list(checkpoint_schema.get("feature_names", []))
+    current_feature_names = list(current_feature_schema.get("feature_names", []))
+    old_weight = checkpoint_state.get("network.0.weight")
+    if old_weight is None:
+        return {
+            "blended_features": 0,
+            "skipped_features": 0,
+            "old_input_dim": len(old_feature_names),
+            "current_input_dim": len(current_feature_names),
+            "blend": float(blend),
+        }
+
+    current_state = model.state_dict()
+    current_weight = current_state.get("network.0.weight")
+    if current_weight is None or current_weight.dim() != 2 or old_weight.dim() != 2:
+        return {
+            "blended_features": 0,
+            "skipped_features": len(current_feature_names),
+            "old_input_dim": len(old_feature_names),
+            "current_input_dim": len(current_feature_names),
+            "blend": float(blend),
+        }
+    if int(current_weight.shape[0]) != int(old_weight.shape[0]):
+        return {
+            "blended_features": 0,
+            "skipped_features": len(current_feature_names),
+            "old_input_dim": len(old_feature_names),
+            "current_input_dim": len(current_feature_names),
+            "blend": float(blend),
+        }
+
+    patterns = [str(pattern) for pattern in (feature_patterns or []) if str(pattern)]
+    old_index = {name: idx for idx, name in enumerate(old_feature_names)}
+    current_index = {name: idx for idx, name in enumerate(current_feature_names)}
+    alpha = min(max(float(blend), 0.0), 1.0)
+    source_weight = old_weight.to(device=current_weight.device, dtype=current_weight.dtype)
+    blended = 0
+    skipped = 0
+    with torch.no_grad():
+        for feature_name in current_feature_names:
+            if feature_name not in old_index:
+                skipped += 1
+                continue
+            if patterns and not any(pattern in str(feature_name) for pattern in patterns):
+                skipped += 1
+                continue
+            current_column = current_index[feature_name]
+            old_column = old_index[feature_name]
+            current_weight[:, current_column].mul_(1.0 - alpha).add_(source_weight[:, old_column], alpha=alpha)
+            blended += 1
+
+    return {
+        "blended_features": blended,
+        "skipped_features": skipped,
+        "old_input_dim": len(old_feature_names),
+        "current_input_dim": len(current_feature_names),
+        "blend": alpha,
+    }
+
+
 def _point_chunks(batch: PointBatch, point_batch_size: int, shuffle: bool) -> list[torch.Tensor]:
     point_count = batch.num_points
     if point_count <= 0:
@@ -1809,15 +2020,21 @@ def train_one_epoch(
                     if host_batch.region_masks is not None and "disk_center_region" in host_batch.region_masks
                     else None
                 )
-                aux_loss = aux_loss + _compute_disk_center_tail_aux_loss(
+                earpiece_region_mask = (
+                    host_batch.region_masks.get("earpiece_region")[chunk].to(device, non_blocking=True)
+                    if host_batch.region_masks is not None and "earpiece_region" in host_batch.region_masks
+                    else None
+                )
+                aux_loss = aux_loss + _compute_region_tail_aux_loss(
                     prediction=prediction,
                     target=target,
                     target_raw=target_raw_chunk,
                     sample_index=host_batch.sample_index[chunk].to(device, non_blocking=True),
                     region_mask=disk_center_region_mask,
                     loss_cfg=loss_cfg,
+                    prefix="disk_center",
                 )
-                aux_loss = aux_loss + _compute_disk_center_underprediction_loss(
+                aux_loss = aux_loss + _compute_region_underprediction_loss(
                     prediction=prediction,
                     target=target,
                     target_raw=target_raw_chunk,
@@ -1825,6 +2042,26 @@ def train_one_epoch(
                     region_mask=disk_center_region_mask,
                     loss_cfg=loss_cfg,
                     y_scaler=y_scaler,
+                    prefix="disk_center",
+                )
+                aux_loss = aux_loss + _compute_region_tail_aux_loss(
+                    prediction=prediction,
+                    target=target,
+                    target_raw=target_raw_chunk,
+                    sample_index=sample_index_chunk,
+                    region_mask=earpiece_region_mask,
+                    loss_cfg=loss_cfg,
+                    prefix="earpiece",
+                )
+                aux_loss = aux_loss + _compute_region_underprediction_loss(
+                    prediction=prediction,
+                    target=target,
+                    target_raw=target_raw_chunk,
+                    sample_index=sample_index_chunk,
+                    region_mask=earpiece_region_mask,
+                    loss_cfg=loss_cfg,
+                    y_scaler=y_scaler,
+                    prefix="earpiece",
                 )
                 aux_loss = aux_loss + _compute_center_curve_consistency_loss(
                     prediction=prediction,
@@ -1841,6 +2078,12 @@ def train_one_epoch(
                     target=target,
                     target_raw=target_raw_chunk,
                     loss_cfg=loss_cfg,
+                )
+                censored_background_loss = _compute_censored_background_loss(
+                    prediction=prediction,
+                    target_raw=target_raw_chunk,
+                    loss_cfg=loss_cfg,
+                    y_scaler=y_scaler,
                 )
                 rank_loss = prediction.new_zeros(())
                 rank_loss = (
@@ -1870,7 +2113,7 @@ def train_one_epoch(
                         loss_cfg=loss_cfg,
                         y_scaler=y_scaler,
                     )
-                loss = loss + aux_loss + low_target_loss + rank_loss
+                loss = loss + aux_loss + low_target_loss + censored_background_loss + rank_loss
             loss.backward()
             if grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -1939,12 +2182,29 @@ def evaluate(
     logger: Any | None = None,
     progress_every_steps: int = 50,
     collect_diagnostics: bool = False,
+    topk_mode: str = "full",
+    include_region_metrics: bool = True,
+    max_sample_batches: int | None = None,
 ) -> EvaluationResult:
+    topk_mode = str(topk_mode or "full").lower()
+    if topk_mode in {"0", "false", "no", "none", "off"}:
+        topk_mode = "none"
+    elif topk_mode in {"selection", "basic", "fast"}:
+        topk_mode = "selection"
+    elif topk_mode != "full":
+        raise ValueError(f"Unsupported evaluation topk_mode: {topk_mode}")
+    if collect_diagnostics and topk_mode != "full":
+        topk_mode = "full"
+
+    include_basic_topk = topk_mode in {"selection", "full"}
+    include_full_topk = topk_mode == "full"
+    region_metric_specs = REGION_TOPK_METRIC_SPECS if include_region_metrics else []
+
     model.eval()
     totals = _empty_point_metric_totals()
     topk_totals = _empty_topk_metric_totals()
-    region_totals = {prefix: _empty_point_metric_totals() for prefix, _ in REGION_TOPK_METRIC_SPECS}
-    region_topk_totals = {prefix: _empty_topk_metric_totals() for prefix, _ in REGION_TOPK_METRIC_SPECS}
+    region_totals = {prefix: _empty_point_metric_totals() for prefix, _ in region_metric_specs}
+    region_topk_totals = {prefix: _empty_topk_metric_totals() for prefix, _ in region_metric_specs}
     top1_abs_sum = 0.0
     top1_log_abs_sum = 0.0
     top1_count = 0
@@ -1956,24 +2216,35 @@ def evaluate(
     diagnostics: list[dict[str, Any]] = []
     started_at = time.monotonic()
     total_loader_steps = len(loader)
+    if max_sample_batches is not None and int(max_sample_batches) > 0:
+        total_loader_steps = min(total_loader_steps, int(max_sample_batches))
     epoch_label = f"{epoch:04d}" if epoch is not None else "????"
 
     with torch.no_grad():
-        for loader_step, host_batch in enumerate(loader, start=1):
+        loader_iter = islice(loader, total_loader_steps)
+        for loader_step, host_batch in enumerate(loader_iter, start=1):
             if host_batch.num_points <= 0:
                 continue
             predictions_scaled = []
             for chunk in _point_chunks(host_batch, point_batch_size=point_batch_size, shuffle=False):
                 features = host_batch.features[chunk].to(device, non_blocking=True)
-                predictions_scaled.append(regression_output(model(features)).detach().cpu())
-            prediction_scaled_cpu = torch.cat(predictions_scaled, dim=0)
-            target_scaled_cpu = host_batch.target_scaled
-            loss = F.smooth_l1_loss(prediction_scaled_cpu, target_scaled_cpu, reduction="sum").item()
-            pred_log, pred_raw = _decode_prediction(prediction_scaled_cpu.to(device), y_scaler)
-            pred_log = pred_log.cpu()
-            pred_raw = pred_raw.cpu()
-            target_log = host_batch.target_log.squeeze(-1)
-            target_raw = host_batch.target_raw
+                predictions_scaled.append(regression_output(model(features)).detach())
+            prediction_scaled = torch.cat(predictions_scaled, dim=0)
+            target_scaled = host_batch.target_scaled.to(device, non_blocking=True)
+            loss = F.smooth_l1_loss(prediction_scaled, target_scaled, reduction="sum").item()
+            pred_log, pred_raw = _decode_prediction(prediction_scaled, y_scaler)
+            target_log = host_batch.target_log.squeeze(-1).to(device, non_blocking=True)
+            target_raw = host_batch.target_raw.to(device, non_blocking=True)
+            sample_index = host_batch.sample_index.to(device, non_blocking=True)
+            region_masks = (
+                {
+                    name: host_batch.region_masks[name].to(device, non_blocking=True).to(dtype=torch.bool)
+                    for _, name in region_metric_specs
+                    if host_batch.region_masks is not None and name in host_batch.region_masks
+                }
+                if region_metric_specs
+                else {}
+            )
 
             abs_error = (pred_raw - target_raw).abs()
             log_abs_error = (pred_log - target_log).abs()
@@ -1987,15 +2258,13 @@ def evaluate(
             )
 
             for sample_idx in range(len(host_batch.names)):
-                mask = host_batch.sample_index == sample_idx
+                mask = sample_index == sample_idx
                 if not bool(mask.any()):
                     continue
                 sample_target = target_raw[mask]
                 sample_pred = pred_raw[mask]
                 sample_target_log = target_log[mask]
                 sample_pred_log = pred_log[mask]
-                sample_target_scaled = target_scaled_cpu[mask]
-                sample_pred_scaled = prediction_scaled_cpu[mask]
                 sample_abs = abs_error[mask]
                 sample_delta = sample_pred - sample_target
                 sample_log_delta = sample_pred_log - sample_target_log
@@ -2013,39 +2282,65 @@ def evaluate(
                 peak_relative_error_sum += peak_relative_error
                 sample_count += 1
 
-                top1_threshold = torch.quantile(sample_target, 0.99)
-                top1_mask = sample_target >= top1_threshold
-                top1_abs_sum += sample_abs[top1_mask].sum().item()
                 sample_log_abs = log_abs_error[mask]
-                top1_log_abs_sum += sample_log_abs[top1_mask].sum().item()
-                top1_count += int(top1_mask.sum().item())
-                sample_top1_mae = sample_abs[top1_mask].mean().item() if bool(top1_mask.any()) else 0.0
-                sample_top1_log_mae = sample_log_abs[top1_mask].mean().item() if bool(top1_mask.any()) else 0.0
+                top1_mask = torch.zeros_like(sample_target, dtype=torch.bool)
+                top5_mask = torch.zeros_like(sample_target, dtype=torch.bool)
+                sample_top1_mae = 0.0
+                sample_top1_log_mae = 0.0
+                sample_top5_mae = 0.0
+                sample_top5_log_mae = 0.0
+                sample_topk_masks: dict[str, torch.Tensor] = {}
+                if include_basic_topk:
+                    top1_threshold = torch.quantile(sample_target, 0.99)
+                    top1_mask = sample_target >= top1_threshold
+                    top1_abs_sum += sample_abs[top1_mask].sum().item()
+                    top1_log_abs_sum += sample_log_abs[top1_mask].sum().item()
+                    top1_count += int(top1_mask.sum().item())
+                    sample_top1_mae = sample_abs[top1_mask].mean().item() if bool(top1_mask.any()) else 0.0
+                    sample_top1_log_mae = sample_log_abs[top1_mask].mean().item() if bool(top1_mask.any()) else 0.0
 
-                top5_threshold = torch.quantile(sample_target, 0.95)
-                top5_mask = sample_target >= top5_threshold
-                top5_abs_sum += sample_abs[top5_mask].sum().item()
-                top5_log_abs_sum += sample_log_abs[top5_mask].sum().item()
-                top5_count += int(top5_mask.sum().item())
-                sample_top5_mae = sample_abs[top5_mask].mean().item() if bool(top5_mask.any()) else 0.0
-                sample_top5_log_mae = sample_log_abs[top5_mask].mean().item() if bool(top5_mask.any()) else 0.0
-                sample_topk_masks = _rank_fraction_masks(sample_target)
-                _update_topk_metric_totals(
-                    topk_totals,
-                    pred_log=sample_pred_log,
-                    pred_raw=sample_pred,
-                    target_log=sample_target_log,
-                    target_raw=sample_target,
-                )
-                for region_prefix, region_name in REGION_TOPK_METRIC_SPECS:
-                    region_mask_all = (
-                        host_batch.region_masks.get(region_name)
-                        if host_batch.region_masks is not None
-                        else None
-                    )
+                    top5_threshold = torch.quantile(sample_target, 0.95)
+                    top5_mask = sample_target >= top5_threshold
+                    top5_abs_sum += sample_abs[top5_mask].sum().item()
+                    top5_log_abs_sum += sample_log_abs[top5_mask].sum().item()
+                    top5_count += int(top5_mask.sum().item())
+                    sample_top5_mae = sample_abs[top5_mask].mean().item() if bool(top5_mask.any()) else 0.0
+                    sample_top5_log_mae = sample_log_abs[top5_mask].mean().item() if bool(top5_mask.any()) else 0.0
+
+                    if include_full_topk:
+                        sample_topk_masks = _rank_fraction_masks(sample_target)
+                        _update_topk_metric_totals(
+                            topk_totals,
+                            pred_log=sample_pred_log,
+                            pred_raw=sample_pred,
+                            target_log=sample_target_log,
+                            target_raw=sample_target,
+                        )
+                    else:
+                        if bool(top1_mask.any()):
+                            _update_point_metric_totals(
+                                topk_totals["top1"],
+                                loss_sum=0.0,
+                                pred_log=sample_pred_log[top1_mask],
+                                pred_raw=sample_pred[top1_mask],
+                                target_log=sample_target_log[top1_mask],
+                                target_raw=sample_target[top1_mask],
+                            )
+                        if bool(top5_mask.any()):
+                            _update_point_metric_totals(
+                                topk_totals["top5"],
+                                loss_sum=0.0,
+                                pred_log=sample_pred_log[top5_mask],
+                                pred_raw=sample_pred[top5_mask],
+                                target_log=sample_target_log[top5_mask],
+                                target_raw=sample_target[top5_mask],
+                            )
+
+                for region_prefix, region_name in region_metric_specs:
+                    region_mask_all = region_masks.get(region_name)
                     if region_mask_all is None:
                         continue
-                    sample_region_mask = region_mask_all[mask].to(dtype=torch.bool)
+                    sample_region_mask = region_mask_all[mask]
                     if not bool(sample_region_mask.any()):
                         continue
                     _update_point_metric_totals(
@@ -2056,19 +2351,20 @@ def evaluate(
                         target_log=sample_target_log[sample_region_mask],
                         target_raw=sample_target[sample_region_mask],
                     )
-                    _update_topk_metric_totals(
-                        region_topk_totals[region_prefix],
-                        pred_log=sample_pred_log[sample_region_mask],
-                        pred_raw=sample_pred[sample_region_mask],
-                        target_log=sample_target_log[sample_region_mask],
-                        target_raw=sample_target[sample_region_mask],
-                    )
+                    if include_full_topk:
+                        _update_topk_metric_totals(
+                            region_topk_totals[region_prefix],
+                            pred_log=sample_pred_log[sample_region_mask],
+                            pred_raw=sample_pred[sample_region_mask],
+                            target_log=sample_target_log[sample_region_mask],
+                            target_raw=sample_target[sample_region_mask],
+                        )
 
                 if collect_diagnostics:
                     sample_points = int(sample_target.numel())
                     sample_loss = F.smooth_l1_loss(
-                        sample_pred_scaled,
-                        sample_target_scaled,
+                        prediction_scaled[mask],
+                        target_scaled[mask],
                         reduction="sum",
                     ).item() / max(sample_points, 1)
                     diagnostics.append(
@@ -2149,27 +2445,39 @@ def evaluate(
                 )
 
     metrics = _finalize_point_metrics(totals)
-    metrics.update(
-        {
-            "earpiece_stress_top1_mae": top1_abs_sum / max(top1_count, 1),
-            "earpiece_stress_top1_log_mae": top1_log_abs_sum / max(top1_count, 1),
-            "earpiece_stress_top5_mae": top5_abs_sum / max(top5_count, 1),
-            "earpiece_stress_top5_log_mae": top5_log_abs_sum / max(top5_count, 1),
-            "earpiece_stress_peak_relative_error": peak_relative_error_sum / max(sample_count, 1),
-            "top1_points": float(top1_count),
-            "top5_points": float(top5_count),
-            "samples": float(sample_count),
-        }
-    )
-    metrics.update(_finalize_topk_metric_totals(topk_totals))
-    for region_prefix, _ in REGION_TOPK_METRIC_SPECS:
-        metrics.update(_finalize_point_metric_totals_with_prefix(region_totals[region_prefix], region_prefix))
+    if include_basic_topk:
         metrics.update(
-            _finalize_topk_metric_totals_with_prefix(
-                region_topk_totals[region_prefix],
-                prefix=region_prefix,
-            )
+            {
+                "earpiece_stress_top1_mae": top1_abs_sum / max(top1_count, 1),
+                "earpiece_stress_top1_log_mae": top1_log_abs_sum / max(top1_count, 1),
+                "earpiece_stress_top5_mae": top5_abs_sum / max(top5_count, 1),
+                "earpiece_stress_top5_log_mae": top5_log_abs_sum / max(top5_count, 1),
+                "earpiece_stress_peak_relative_error": peak_relative_error_sum / max(sample_count, 1),
+                "top1_points": float(top1_count),
+                "top5_points": float(top5_count),
+                "samples": float(sample_count),
+            }
         )
+        topk_metrics = _finalize_topk_metric_totals(topk_totals)
+        if not include_full_topk:
+            topk_metrics = {
+                key: value
+                for key, value in topk_metrics.items()
+                if (
+                    (key.startswith("earpiece_stress_top1_") and not key.startswith("earpiece_stress_top1_5_"))
+                    or (key.startswith("earpiece_stress_top5_") and not key.startswith("earpiece_stress_top5_10_"))
+                )
+            }
+        metrics.update(topk_metrics)
+    for region_prefix, _ in region_metric_specs:
+        metrics.update(_finalize_point_metric_totals_with_prefix(region_totals[region_prefix], region_prefix))
+        if include_full_topk:
+            metrics.update(
+                _finalize_topk_metric_totals_with_prefix(
+                    region_topk_totals[region_prefix],
+                    prefix=region_prefix,
+                )
+            )
     return EvaluationResult(metrics=metrics, diagnostics=diagnostics)
 
 
@@ -2420,6 +2728,42 @@ class NodeMLPTrainer:
                     )
             else:
                 raise FileNotFoundError(f"training.init_checkpoint does not exist: {checkpoint_path}")
+        aux_init_checkpoints = self.training_cfg.get("aux_init_checkpoints", [])
+        if isinstance(aux_init_checkpoints, (str, Path)):
+            aux_init_checkpoints = [{"path": str(aux_init_checkpoints)}]
+        for aux_item in aux_init_checkpoints or []:
+            if isinstance(aux_item, dict):
+                aux_path = Path(str(aux_item.get("path", aux_item.get("checkpoint", ""))))
+                blend = float(aux_item.get("blend", aux_item.get("weight", 0.25)))
+                raw_patterns = aux_item.get("feature_patterns", aux_item.get("patterns", []))
+                feature_patterns = (
+                    [str(raw_patterns)]
+                    if isinstance(raw_patterns, str)
+                    else [str(pattern) for pattern in (raw_patterns or [])]
+                )
+            else:
+                aux_path = Path(str(aux_item))
+                blend = 0.25
+                feature_patterns = []
+            if not aux_path.exists():
+                raise FileNotFoundError(f"training.aux_init_checkpoints path does not exist: {aux_path}")
+            self.logger.info(
+                "Blending first-layer feature weights from auxiliary checkpoint: %s | blend=%.3f",
+                aux_path,
+                blend,
+            )
+            aux_checkpoint = torch.load(aux_path, map_location="cpu")
+            aux_summary = _blend_first_layer_from_checkpoint(
+                self.model,
+                checkpoint=aux_checkpoint,
+                current_feature_schema=self.feature_schema,
+                blend=blend,
+                feature_patterns=feature_patterns,
+            )
+            self.logger.info(
+                "Auxiliary first-layer blend summary: %s",
+                json.dumps(aux_summary, ensure_ascii=False),
+            )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(self.training_cfg.get("lr", 1e-3)),
@@ -2504,6 +2848,24 @@ class NodeMLPTrainer:
         progress_every_steps = int(self.training_cfg.get("progress_every_steps", 50))
         eval_progress_every_steps = int(self.training_cfg.get("eval_progress_every_steps", progress_every_steps))
         write_diagnostics = bool(self.training_cfg.get("write_diagnostics", True))
+        eval_topk_mode = str(self.training_cfg.get("eval_topk_mode", "full"))
+        eval_include_region_metrics = bool(self.training_cfg.get("eval_include_region_metrics", True))
+        eval_max_sample_batches = self.training_cfg.get("eval_max_sample_batches")
+        eval_max_sample_batches = (
+            int(eval_max_sample_batches)
+            if eval_max_sample_batches is not None and int(eval_max_sample_batches) > 0
+            else None
+        )
+        test_on_best = bool(self.training_cfg.get("test_on_best", True))
+        final_test_after_training = bool(self.training_cfg.get("final_test_after_training", not test_on_best))
+        final_test_topk_mode = str(self.training_cfg.get("final_test_topk_mode", "full"))
+        final_test_include_region_metrics = bool(self.training_cfg.get("final_test_include_region_metrics", True))
+        final_test_max_sample_batches = self.training_cfg.get("final_test_max_sample_batches")
+        final_test_max_sample_batches = (
+            int(final_test_max_sample_batches)
+            if final_test_max_sample_batches is not None and int(final_test_max_sample_batches) > 0
+            else None
+        )
 
         for epoch in range(1, int(self.training_cfg.get("epochs", 30)) + 1):
             train_loader = self._make_loader(
@@ -2551,6 +2913,9 @@ class NodeMLPTrainer:
                 logger=self.logger,
                 progress_every_steps=eval_progress_every_steps,
                 collect_diagnostics=write_diagnostics,
+                topk_mode=eval_topk_mode,
+                include_region_metrics=eval_include_region_metrics,
+                max_sample_batches=eval_max_sample_batches,
             )
             val_metrics = val_result.metrics
             history_row["val_loss"] = round(float(val_metrics["loss"]), 8)
@@ -2575,7 +2940,7 @@ class NodeMLPTrainer:
                 wait = 0
                 test_metrics: dict[str, float] = {}
                 test_result = EvaluationResult(metrics={}, diagnostics=[])
-                if self.test_sample_paths:
+                if test_on_best and self.test_sample_paths:
                     test_loader = self._make_loader(self.test_sample_paths, shuffle=False)
                     test_result = evaluate(
                         model=self.model,
@@ -2588,11 +2953,14 @@ class NodeMLPTrainer:
                         logger=self.logger,
                         progress_every_steps=eval_progress_every_steps,
                         collect_diagnostics=write_diagnostics,
+                        topk_mode=final_test_topk_mode,
+                        include_region_metrics=final_test_include_region_metrics,
+                        max_sample_batches=final_test_max_sample_batches,
                     )
                     test_metrics = test_result.metrics
                 if write_diagnostics:
                     write_evaluation_diagnostics(self.save_dir / "best_val_diagnostics.csv", val_result.diagnostics)
-                    if self.test_sample_paths:
+                    if test_on_best and self.test_sample_paths:
                         write_evaluation_diagnostics(self.save_dir / "best_test_diagnostics.csv", test_result.diagnostics)
                 best_payload = {
                     "epoch": epoch,
@@ -2621,5 +2989,32 @@ class NodeMLPTrainer:
 
         if best_payload is None:
             raise RuntimeError("Training finished without a saved checkpoint.")
+        if final_test_after_training and (not test_on_best) and self.test_sample_paths:
+            checkpoint_path = self.save_dir / "best.pt"
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            self.model.load_state_dict(checkpoint["model_state"])
+            self.logger.info("Running final test for best checkpoint: %s", checkpoint_path)
+            test_loader = self._make_loader(self.test_sample_paths, shuffle=False)
+            test_result = evaluate(
+                model=self.model,
+                loader=test_loader,
+                y_scaler=self.y_scaler,
+                device=self.device,
+                point_batch_size=point_batch_size,
+                split_name="test",
+                epoch=int(best_payload["epoch"]),
+                logger=self.logger,
+                progress_every_steps=eval_progress_every_steps,
+                collect_diagnostics=write_diagnostics,
+                topk_mode=final_test_topk_mode,
+                include_region_metrics=final_test_include_region_metrics,
+                max_sample_batches=final_test_max_sample_batches,
+            )
+            best_payload["test_metrics"] = test_result.metrics
+            checkpoint["metrics"] = best_payload
+            torch.save(checkpoint, checkpoint_path)
+            write_json(self.save_dir / "metrics.json", best_payload)
+            if write_diagnostics:
+                write_evaluation_diagnostics(self.save_dir / "best_test_diagnostics.csv", test_result.diagnostics)
         self.logger.info("Best run summary:\n%s", json.dumps(best_payload, indent=2, ensure_ascii=False))
         return best_payload

@@ -6,10 +6,9 @@ from pathlib import Path
 import torch
 
 from case7_node_mlp.data import discover_case_index, expand_case_sample_paths, resolve_case_splits
-from case7_node_mlp.models import PointMLP
 from case7_node_mlp.runtime import ensure_dir, make_logger, read_config, resolve_device, write_json
 from case7_node_mlp.scalers import StandardScaler
-from case7_node_mlp.trainer import evaluate, make_loader, write_evaluation_diagnostics
+from case7_node_mlp.trainer import build_model, evaluate, make_loader, write_evaluation_diagnostics
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,13 +76,7 @@ def main() -> None:
     feature_schema = dict(checkpoint["feature_schema"])
     x_scaler = StandardScaler.from_state_dict(checkpoint["x_scaler"])
     y_scaler = StandardScaler.from_state_dict(checkpoint["y_scaler"])
-    model = PointMLP(
-        input_dim=int(feature_schema["input_dim"]),
-        hidden_dims=[int(dim) for dim in config.get("model", {}).get("hidden_dims", [256, 256, 128])],
-        dropout=float(config.get("model", {}).get("dropout", 0.0)),
-        activation=str(config.get("model", {}).get("activation", "silu")),
-        use_layer_norm=bool(config.get("model", {}).get("layer_norm", True)),
-    ).to(device)
+    model = build_model(config, input_dim=int(feature_schema["input_dim"]), feature_schema=feature_schema).to(device)
     model.load_state_dict(checkpoint["model_state"])
 
     case_index = discover_case_index(dataset_cfg["root"])
