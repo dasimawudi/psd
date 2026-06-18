@@ -2773,8 +2773,22 @@ class NodeMLPTrainer:
         write_yaml(self.save_dir / "resolved_config.yaml", self.resolved_config)
         write_json(self.save_dir / "feature_schema.json", self.feature_schema)
 
-    def _make_loader(self, sample_paths: list[Path], shuffle: bool) -> DataLoader[PointBatch]:
+    def _make_loader(self, sample_paths: list[Path], shuffle: bool, is_eval: bool = False) -> DataLoader[PointBatch]:
         assert self.x_scaler is not None and self.y_scaler is not None
+
+        sample_batch_size = int(self.training_cfg.get("sample_batch_size", 1))
+        num_workers = int(self.training_cfg.get("num_workers", 0))
+        prefetch_factor = self.training_cfg.get("prefetch_factor")
+        persistent_workers = bool(self.training_cfg.get("persistent_workers", False))
+
+        if is_eval:
+            sample_batch_size = int(self.training_cfg.get("eval_sample_batch_size", sample_batch_size))
+            num_workers = int(self.training_cfg.get("eval_num_workers", num_workers))
+            if "eval_prefetch_factor" in self.training_cfg:
+                prefetch_factor = self.training_cfg.get("eval_prefetch_factor")
+            if "eval_persistent_workers" in self.training_cfg:
+                persistent_workers = bool(self.training_cfg.get("eval_persistent_workers"))
+
         return make_loader(
             sample_paths=sample_paths,
             dataset_cfg=self.dataset_cfg,
@@ -2784,11 +2798,11 @@ class NodeMLPTrainer:
             feature_schema=self.feature_schema,
             target_cfg=self.target_cfg,
             loss_cfg=self.loss_cfg,
-            sample_batch_size=int(self.training_cfg.get("sample_batch_size", 1)),
-            num_workers=int(self.training_cfg.get("num_workers", 0)),
+            sample_batch_size=sample_batch_size,
+            num_workers=num_workers,
             shuffle=shuffle,
-            persistent_workers=bool(self.training_cfg.get("persistent_workers", False)),
-            prefetch_factor=self.training_cfg.get("prefetch_factor"),
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
             pin_memory=self.training_cfg.get("pin_memory"),
             cache_prepared_samples=bool(self.training_cfg.get("cache_prepared_samples", False)),
             max_cached_samples_per_worker=self.training_cfg.get("max_cached_samples_per_worker"),
@@ -2901,7 +2915,7 @@ class NodeMLPTrainer:
                 )
                 continue
 
-            val_loader = self._make_loader(self.val_sample_paths, shuffle=False)
+            val_loader = self._make_loader(self.val_sample_paths, shuffle=False, is_eval=True)
             val_result = evaluate(
                 model=self.model,
                 loader=val_loader,
@@ -2941,7 +2955,7 @@ class NodeMLPTrainer:
                 test_metrics: dict[str, float] = {}
                 test_result = EvaluationResult(metrics={}, diagnostics=[])
                 if test_on_best and self.test_sample_paths:
-                    test_loader = self._make_loader(self.test_sample_paths, shuffle=False)
+                    test_loader = self._make_loader(self.test_sample_paths, shuffle=False, is_eval=True)
                     test_result = evaluate(
                         model=self.model,
                         loader=test_loader,
@@ -2994,7 +3008,7 @@ class NodeMLPTrainer:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
             self.model.load_state_dict(checkpoint["model_state"])
             self.logger.info("Running final test for best checkpoint: %s", checkpoint_path)
-            test_loader = self._make_loader(self.test_sample_paths, shuffle=False)
+            test_loader = self._make_loader(self.test_sample_paths, shuffle=False, is_eval=True)
             test_result = evaluate(
                 model=self.model,
                 loader=test_loader,

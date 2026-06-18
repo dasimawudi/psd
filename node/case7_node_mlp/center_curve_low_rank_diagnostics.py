@@ -74,6 +74,16 @@ def _target_floor(config: dict[str, Any], schema: dict[str, Any], override: str 
     return float(_resolve_threshold_from_config(dict(config.get("target", {})), schema, "zero_below"))
 
 
+def _target_floor_needs_stats(config: dict[str, Any], override: str | None) -> bool:
+    raw_value = override if override is not None else dict(config.get("target", {})).get("zero_below", 0.0)
+    if raw_value is None:
+        return False
+    if isinstance(raw_value, str):
+        value = raw_value.strip().lower()
+        return value.startswith("p95*") or value.startswith("p99*")
+    return False
+
+
 def _load_target_stats(sample_paths: list[Path], dataset_cfg: dict[str, Any], max_values: int = 500_000) -> dict[str, float]:
     values: list[np.ndarray] = []
     per_file_cap = max(1, int(max_values) // max(len(sample_paths), 1))
@@ -283,7 +293,7 @@ def run_diagnostics(
     selected_case_names = _select_cases(splits.get(split, []), case_names, num_cases=num_cases, seed=seed)
     selected_case_dirs = [case_index[name] for name in selected_case_names]
     all_sample_paths = expand_case_sample_paths(selected_case_dirs, dataset_cfg)
-    target_stats = _load_target_stats(all_sample_paths, dataset_cfg)
+    target_stats = _load_target_stats(all_sample_paths, dataset_cfg) if _target_floor_needs_stats(config, target_floor_override) else {}
     floor = _target_floor(config, target_stats, target_floor_override)
     rows: list[dict[str, Any]] = []
     for offset, case_dir in enumerate(selected_case_dirs, start=1):

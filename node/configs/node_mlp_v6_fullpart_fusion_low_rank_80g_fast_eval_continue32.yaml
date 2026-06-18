@@ -1,0 +1,34 @@
+base_config: node_mlp_v6_fullpart_fusion_low_rank_80g.yaml
+
+training:
+  epochs: 48
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 2
+  eval_sample_batch_size: 16
+  eval_num_workers: 2
+  eval_prefetch_factor: 1
+  eval_every: 2
+  eval_topk_mode: selection
+  eval_include_region_metrics: true
+  final_test_after_training: true
+  final_test_topk_mode: full
+  final_test_include_region_metrics: true
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g/best.pt
+  allow_partial_init_checkpoint: false
+  aux_init_checkpoints: []
+  selection_metric: composite_v6_fullpart_fusion_low_rank_80g_fast_eval
+  # Pair-list form replaces the base selection mapping under read_config's deep-merge semantics.
+  selection:
+    - - mode
+      - weighted_sum
+    - - name
+      - composite_v6_fullpart_fusion_low_rank_80g_fast_eval
+    - - components
+      - fullpart_stress_miss25_rate: 0.25
+        earpiece_stress_top1_miss25_rate: 0.18
+        earpiece_stress_top5_miss25_rate: 0.22
+        disk_center_stress_miss25_rate: 0.30
+        earpiece_region_stress_miss25_rate: 0.35
+        earpiece_stress_log_mae: 0.15
+  save_dir: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32
