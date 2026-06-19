@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
@@ -703,6 +704,7 @@ def _plot_region(path: Path, rows: list[dict[str, Any]], region_name: str) -> No
     bars = ax.bar(centers, counts, width=widths, align="center", color=color, alpha=0.84, edgecolor="white", linewidth=0.25)
     ax.set_xscale("log")
     ax.set_yscale("log")
+    _set_dense_log_x_ticks(ax)
     ax.set_xlabel("PSD value at one frequency")
     ax.set_ylabel("Count, log scale")
     ax.set_title(f"{label} training PSD distribution by 1% quantile band")
@@ -811,6 +813,33 @@ def _plot_histogram_region(
     plt.close(fig)
 
 
+def _format_dense_log_tick(value: float, _: Any) -> str:
+    if value <= 0.0 or not math.isfinite(value):
+        return ""
+    exponent = int(math.floor(math.log10(value)))
+    mantissa = value / (10.0**exponent)
+    if math.isclose(mantissa, round(mantissa), rel_tol=1e-6, abs_tol=1e-6):
+        mantissa = float(round(mantissa))
+    return f"{mantissa:g}e{exponent}"
+
+
+def _set_dense_log_x_ticks(ax: Any) -> None:
+    xmin, xmax = ax.get_xlim()
+    if xmin <= 0.0 or xmax <= xmin:
+        return
+    ticks: list[float] = []
+    min_exp = int(math.floor(math.log10(xmin)))
+    max_exp = int(math.ceil(math.log10(xmax)))
+    for exponent in range(min_exp, max_exp + 1):
+        value = 10.0**exponent
+        if xmin <= value <= xmax:
+            ticks.append(value)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([_format_dense_log_tick(value, None) for value in ticks], rotation=0)
+    ax.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=np.arange(1.0, 10.0), numticks=120))
+    ax.tick_params(axis="x", which="major", labelsize=7)
+
+
 def _plot_histogram_combined(
     path: Path,
     rows_by_region: dict[str, list[dict[str, Any]]],
@@ -829,6 +858,7 @@ def _plot_histogram_combined(
         ax.bar(centers, counts, width=widths, align="center", color=color, alpha=0.86, edgecolor="white", linewidth=0.25)
         ax.set_xscale("log")
         ax.set_yscale("log")
+        _set_dense_log_x_ticks(ax)
         ax.set_ylabel("Count, log")
         zero_count = int(value_stats[region_name]["zero_count"])
         total_points = int(value_stats[region_name]["points"])
@@ -838,7 +868,7 @@ def _plot_histogram_combined(
         ax.grid(True, axis="x", which="minor", alpha=0.08)
     axes[-1].set_xlabel("PSD value at one frequency")
     fig.suptitle("Training PSD value histogram by region, 100 log-spaced value bins", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.tight_layout(rect=(0, 0.01, 1, 0.98))
     fig.savefig(path, dpi=180)
     plt.close(fig)
 
