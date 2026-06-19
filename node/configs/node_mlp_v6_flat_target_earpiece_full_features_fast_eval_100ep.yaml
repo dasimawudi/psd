@@ -1,0 +1,6 @@
+base_config: node_mlp_v6_flat_target_earpiece_full_features_fast_eval.yaml
+
+training:
+  epochs: 100
+  early_stopping_patience: 100
+  save_dir: node/outputs/node_mlp_v6_flat_target_earpiece_full_features_fast_eval_100ep
