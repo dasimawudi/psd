@@ -1296,8 +1296,22 @@ class PointSampleDataset(Dataset[PreparedPointSample]):
 
 
 def collate_point_samples(samples: list[PreparedPointSample]) -> PointBatch:
+    feature_dim = int(samples[0].features.shape[-1]) if samples else 0
+    samples = [sample for sample in samples if sample.num_points > 0]
     if not samples:
-        raise ValueError("Cannot collate an empty sample list.")
+        return PointBatch(
+            names=[],
+            case_names=[],
+            frequency_hz=torch.empty((0,), dtype=torch.float32),
+            features=torch.empty((0, feature_dim), dtype=torch.float32),
+            target_scaled=torch.empty((0, 1), dtype=torch.float32),
+            target_log=torch.empty((0, 1), dtype=torch.float32),
+            target_raw=torch.empty((0,), dtype=torch.float32),
+            sample_index=torch.empty((0,), dtype=torch.long),
+            node_indices=torch.empty((0,), dtype=torch.long),
+            point_weights=torch.empty((0,), dtype=torch.float32),
+            region_masks=None,
+        )
 
     features = []
     target_scaled = []
@@ -1485,6 +1499,92 @@ def estimate_target_quantiles(
         "target_positive_p99": float(np.quantile(positive, 0.99)),
         "target_positive_p999": float(np.quantile(positive, 0.999)),
     }
+
+
+def _filter_nonempty_sample_paths(
+    sample_paths: list[Path],
+    dataset_cfg: dict[str, Any],
+    *,
+    split_name: str,
+    num_workers: int,
+    logger: Any | None = None,
+) -> list[Path]:
+    if not bool(dataset_cfg.get("drop_empty_samples", False)):
+        return sample_paths
+    if not sample_paths:
+        return []
+
+    started_at = time.monotonic()
+    workers = max(1, int(num_workers))
+    kept: list[Path] = []
+    if logger is not None:
+        logger.info("Filtering empty %s samples | samples=%s | workers=%s", split_name, len(sample_paths), workers)
+
+    def is_nonempty(path: Path) -> bool:
+        return bool(_load_target_values_for_stats(path, dataset_cfg).size > 0)
+
+    if workers == 1:
+        for idx, path in enumerate(sample_paths, start=1):
+            if is_nonempty(path):
+                kept.append(path)
+            if logger is not None and (idx == 1 or idx == len(sample_paths) or idx % 1000 == 0):
+                logger.info(
+                    "Filter %s progress | sample=%s/%s | kept=%s | elapsed=%s",
+                    split_name,
+                    idx,
+                    len(sample_paths),
+                    len(kept),
+                    _format_duration(time.monotonic() - started_at),
+                )
+    else:
+        keep_by_path: dict[Path, bool] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            path_iter = iter(sample_paths)
+            max_pending = max(workers, workers * 4)
+            pending: dict[Any, Path] = {}
+
+            def submit_until_full() -> None:
+                while len(pending) < max_pending:
+                    try:
+                        path = next(path_iter)
+                    except StopIteration:
+                        return
+                    pending[executor.submit(is_nonempty, path)] = path
+
+            submit_until_full()
+            completed = 0
+            while pending:
+                done, _ = wait(set(pending), return_when=FIRST_COMPLETED)
+                for future in done:
+                    path = pending.pop(future)
+                    completed += 1
+                    try:
+                        keep_by_path[path] = bool(future.result())
+                    except Exception as exc:
+                        raise RuntimeError(f"Failed to filter sample: {path}") from exc
+                if logger is not None and (
+                    completed == 1 or completed == len(sample_paths) or completed % 1000 == 0
+                ):
+                    logger.info(
+                        "Filter %s progress | sample=%s/%s | kept=%s | elapsed=%s",
+                        split_name,
+                        completed,
+                        len(sample_paths),
+                        sum(1 for keep in keep_by_path.values() if keep),
+                        _format_duration(time.monotonic() - started_at),
+                    )
+                submit_until_full()
+        kept = [path for path in sample_paths if keep_by_path.get(path, False)]
+
+    if logger is not None:
+        logger.info(
+            "Filtered empty %s samples | kept=%s/%s | elapsed=%s",
+            split_name,
+            len(kept),
+            len(sample_paths),
+            _format_duration(time.monotonic() - started_at),
+        )
+    return kept
 
 
 def fit_scalers(
@@ -2614,6 +2714,28 @@ class NodeMLPTrainer:
         self.train_sample_paths = expand_case_sample_paths(train_case_dirs, self.dataset_cfg)
         self.val_sample_paths = expand_case_sample_paths(val_case_dirs, self.dataset_cfg)
         self.test_sample_paths = expand_case_sample_paths(test_case_dirs, self.dataset_cfg)
+        filter_workers = int(self.scaler_cfg.get("num_workers", self.training_cfg.get("num_workers", 0)))
+        self.train_sample_paths = _filter_nonempty_sample_paths(
+            self.train_sample_paths,
+            self.dataset_cfg,
+            split_name="train",
+            num_workers=filter_workers,
+            logger=self.logger,
+        )
+        self.val_sample_paths = _filter_nonempty_sample_paths(
+            self.val_sample_paths,
+            self.dataset_cfg,
+            split_name="val",
+            num_workers=filter_workers,
+            logger=self.logger,
+        )
+        self.test_sample_paths = _filter_nonempty_sample_paths(
+            self.test_sample_paths,
+            self.dataset_cfg,
+            split_name="test",
+            num_workers=filter_workers,
+            logger=self.logger,
+        )
 
         scaler_cache_path = self.scaler_cfg.get("cache_path")
         target_stats_cache_path = self.scaler_cfg.get("target_stats_cache_path", scaler_cache_path)

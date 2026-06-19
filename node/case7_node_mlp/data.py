@@ -517,6 +517,27 @@ def _build_pointset_mask(nodes_df: pd.DataFrame, case_name: str, pointset_cfg: d
     return np.isin(node_values, np.fromiter(allowed_nodes, dtype=np.int64)).astype(bool, copy=False)
 
 
+def _build_target_value_range_mask(target_values: np.ndarray, dataset_cfg: dict[str, Any]) -> np.ndarray:
+    range_cfg = (
+        dataset_cfg.get("target_value_range")
+        or dataset_cfg.get("target_range")
+        or dataset_cfg.get("flat_target_range")
+    )
+    if not range_cfg:
+        return np.ones(target_values.shape, dtype=bool)
+    if not isinstance(range_cfg, dict):
+        raise ValueError("dataset.target_value_range must be a mapping with min/max values.")
+
+    min_value = range_cfg.get("min", range_cfg.get("min_raw"))
+    max_value = range_cfg.get("max", range_cfg.get("max_raw"))
+    mask = np.ones(target_values.shape, dtype=bool)
+    if min_value is not None:
+        mask &= target_values >= float(min_value)
+    if max_value is not None:
+        mask &= target_values < float(max_value)
+    return mask
+
+
 def _build_node_scope_mask(
     nodes_df: pd.DataFrame,
     payload: dict[str, Any],
@@ -531,6 +552,8 @@ def _build_node_scope_mask(
     scope = str(raw_scope).strip().lower()
     if scope in {"earpiece", "earpiece_only", "ear"}:
         mask = earpiece_mask.astype(bool, copy=True)
+    elif scope in {"disk", "disk_region", "disk_only", "plate", "plate_region"}:
+        mask = ~earpiece_mask.astype(bool, copy=True)
     elif scope in {"disk_center", "center", "center_region", "disk_center_region"}:
         mask = _build_disk_center_region_mask(nodes_df)
     elif scope in {"all", "all_nodes", "full", "full_part", "fullpart"}:
@@ -569,6 +592,7 @@ def build_node_selection_mask(
     )
     if target_values is not None:
         mask &= np.isfinite(target_values) & (target_values >= 0.0)
+        mask &= _build_target_value_range_mask(target_values, dataset_cfg)
     return mask
 
 

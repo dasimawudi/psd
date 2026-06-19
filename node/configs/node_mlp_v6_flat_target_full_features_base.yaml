@@ -1,0 +1,46 @@
+base_config: node_mlp_v6_fullpart_disk_center.yaml
+
+dataset:
+  drop_empty_samples: true
+  target_value_range:
+    min: 1000000.0
+    max: 10000000.0
+
+scaler:
+  num_workers: 8
+  sample_seed: 42
+  prefetch_factor: 1
+  sample_limit: 512
+  overwrite_cache: true
+  reuse_target_stats_from_cache: false
+  target_stats_sample_limit: 512
+  target_stats_max_values: 500000
+
+training:
+  seed: 42
+  device: auto
+  epochs: 20
+  lr: 0.00008
+  batch_size: 2097152
+  sample_batch_size: 256
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 1
+  pin_memory: true
+  cache_prepared_samples: false
+  shuffle_samples: false
+  eval_every: 1
+  eval_topk_mode: basic
+  eval_include_region_metrics: true
+  eval_max_sample_batches: 8
+  test_on_best: false
+  final_test_after_training: true
+  final_test_topk_mode: basic
+  final_test_include_region_metrics: true
+  final_test_max_sample_batches: 8
+  write_diagnostics: false
+  early_stopping_patience: 4
+  progress_every_steps: 20
+  eval_progress_every_steps: 20
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_disk_center/best.pt
+  allow_partial_init_checkpoint: true
