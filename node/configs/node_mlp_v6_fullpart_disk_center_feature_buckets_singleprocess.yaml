@@ -3,3 +3,8 @@ base_config: node_mlp_v6_fullpart_disk_center_feature_buckets.yaml
 training:
   num_workers: 0
   persistent_workers: false
+  eval_sample_batch_size: 4
+  eval_num_workers: 0
+  eval_persistent_workers: false
+  eval_pin_memory: false
+  run_test_on_best: false

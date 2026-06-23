@@ -1654,7 +1654,7 @@ def evaluate(
     total_loader_steps = len(loader)
     epoch_label = f"{epoch:04d}" if epoch is not None else "????"
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for loader_step, host_batch in enumerate(loader, start=1):
             if host_batch.num_points <= 0:
                 continue
@@ -1663,11 +1663,10 @@ def evaluate(
                 features = host_batch.features[chunk].to(device, non_blocking=True)
                 predictions_scaled.append(model(features).detach().cpu())
             prediction_scaled_cpu = torch.cat(predictions_scaled, dim=0)
+            del predictions_scaled
             target_scaled_cpu = host_batch.target_scaled
             loss = F.smooth_l1_loss(prediction_scaled_cpu, target_scaled_cpu, reduction="sum").item()
-            pred_log, pred_raw = _decode_prediction(prediction_scaled_cpu.to(device), y_scaler)
-            pred_log = pred_log.cpu()
-            pred_raw = pred_raw.cpu()
+            pred_log, pred_raw = _decode_prediction(prediction_scaled_cpu, y_scaler)
             target_log = host_batch.target_log.squeeze(-1)
             target_raw = host_batch.target_raw
 
@@ -2122,8 +2121,19 @@ class NodeMLPTrainer:
         write_yaml(self.save_dir / "resolved_config.yaml", self.resolved_config)
         write_json(self.save_dir / "feature_schema.json", self.feature_schema)
 
-    def _make_loader(self, sample_paths: list[Path], shuffle: bool) -> DataLoader[PointBatch]:
+    def _make_loader(
+        self,
+        sample_paths: list[Path],
+        shuffle: bool,
+        *,
+        for_eval: bool = False,
+    ) -> DataLoader[PointBatch]:
         assert self.x_scaler is not None and self.y_scaler is not None
+        prefix = "eval_" if for_eval else ""
+
+        def cfg_value(name: str, default: Any) -> Any:
+            return self.training_cfg.get(f"{prefix}{name}", default)
+
         return make_loader(
             sample_paths=sample_paths,
             dataset_cfg=self.dataset_cfg,
@@ -2133,12 +2143,12 @@ class NodeMLPTrainer:
             feature_schema=self.feature_schema,
             target_cfg=self.target_cfg,
             loss_cfg=self.loss_cfg,
-            sample_batch_size=int(self.training_cfg.get("sample_batch_size", 1)),
-            num_workers=int(self.training_cfg.get("num_workers", 0)),
+            sample_batch_size=int(cfg_value("sample_batch_size", self.training_cfg.get("sample_batch_size", 1))),
+            num_workers=int(cfg_value("num_workers", self.training_cfg.get("num_workers", 0))),
             shuffle=shuffle,
-            persistent_workers=bool(self.training_cfg.get("persistent_workers", False)),
-            prefetch_factor=self.training_cfg.get("prefetch_factor"),
-            pin_memory=self.training_cfg.get("pin_memory"),
+            persistent_workers=bool(cfg_value("persistent_workers", self.training_cfg.get("persistent_workers", False))),
+            prefetch_factor=cfg_value("prefetch_factor", self.training_cfg.get("prefetch_factor")),
+            pin_memory=cfg_value("pin_memory", self.training_cfg.get("pin_memory")),
             cache_prepared_samples=bool(self.training_cfg.get("cache_prepared_samples", False)),
             max_cached_samples_per_worker=self.training_cfg.get("max_cached_samples_per_worker"),
         )
@@ -2197,6 +2207,7 @@ class NodeMLPTrainer:
         progress_every_steps = int(self.training_cfg.get("progress_every_steps", 50))
         eval_progress_every_steps = int(self.training_cfg.get("eval_progress_every_steps", progress_every_steps))
         write_diagnostics = bool(self.training_cfg.get("write_diagnostics", True))
+        run_test_on_best = bool(self.training_cfg.get("run_test_on_best", True))
 
         for epoch in range(1, int(self.training_cfg.get("epochs", 30)) + 1):
             train_loader = self._make_loader(
@@ -2232,7 +2243,7 @@ class NodeMLPTrainer:
                 )
                 continue
 
-            val_loader = self._make_loader(self.val_sample_paths, shuffle=False)
+            val_loader = self._make_loader(self.val_sample_paths, shuffle=False, for_eval=True)
             val_result = evaluate(
                 model=self.model,
                 loader=val_loader,
@@ -2268,8 +2279,8 @@ class NodeMLPTrainer:
                 wait = 0
                 test_metrics: dict[str, float] = {}
                 test_result = EvaluationResult(metrics={}, diagnostics=[])
-                if self.test_sample_paths:
-                    test_loader = self._make_loader(self.test_sample_paths, shuffle=False)
+                if self.test_sample_paths and run_test_on_best:
+                    test_loader = self._make_loader(self.test_sample_paths, shuffle=False, for_eval=True)
                     test_result = evaluate(
                         model=self.model,
                         loader=test_loader,
@@ -2283,9 +2294,14 @@ class NodeMLPTrainer:
                         collect_diagnostics=write_diagnostics,
                     )
                     test_metrics = test_result.metrics
+                elif self.test_sample_paths:
+                    self.logger.info(
+                        "Epoch %04d | test evaluation skipped because training.run_test_on_best=false",
+                        epoch,
+                    )
                 if write_diagnostics:
                     write_evaluation_diagnostics(self.save_dir / "best_val_diagnostics.csv", val_result.diagnostics)
-                    if self.test_sample_paths:
+                    if self.test_sample_paths and run_test_on_best:
                         write_evaluation_diagnostics(self.save_dir / "best_test_diagnostics.csv", test_result.diagnostics)
                 best_payload = {
                     "epoch": epoch,

@@ -107,9 +107,21 @@ def main() -> None:
         feature_schema=feature_schema,
         target_cfg=target_cfg,
         loss_cfg=loss_cfg,
-        sample_batch_size=int(args.sample_batch_size or training_cfg.get("sample_batch_size", 1)),
-        num_workers=int(args.num_workers if args.num_workers is not None else training_cfg.get("num_workers", 0)),
+        sample_batch_size=int(
+            args.sample_batch_size
+            or training_cfg.get("eval_sample_batch_size", training_cfg.get("sample_batch_size", 1))
+        ),
+        num_workers=int(
+            args.num_workers
+            if args.num_workers is not None
+            else training_cfg.get("eval_num_workers", training_cfg.get("num_workers", 0))
+        ),
         shuffle=False,
+        persistent_workers=bool(
+            training_cfg.get("eval_persistent_workers", training_cfg.get("persistent_workers", False))
+        ),
+        prefetch_factor=training_cfg.get("eval_prefetch_factor", training_cfg.get("prefetch_factor")),
+        pin_memory=training_cfg.get("eval_pin_memory", training_cfg.get("pin_memory")),
     )
     result = evaluate(
         model=model,
