@@ -1,0 +1,45 @@
+base_config: node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32.yaml
+
+dataset:
+  # Remove all disk nodes from the center to the outer edge of the four plate holes:
+  # sqrt(x^2 + y^2) <= fixed_geometry.plate_HoleDist + fixed_geometry.plate_HoleRadius.
+  exclude_inner_disk_to_plate_hole_outer_edge: true
+
+loss:
+  disk_center_top5_loss_weight: 0.0
+  disk_center_top1_loss_weight: 0.0
+  disk_center_top5_under_weight: 0.0
+  disk_center_top1_under_weight: 0.0
+  center_region_point_weight: 1.0
+  center_curve_consistency_weight: 0.0
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_scalers.pt
+  target_stats_cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_scalers.pt
+  overwrite_cache: false
+  reuse_target_stats_from_cache: true
+
+training:
+  epochs: 100
+  eval_every: 2
+  eval_topk_mode: selection
+  eval_include_region_metrics: true
+  final_test_after_training: true
+  final_test_topk_mode: full
+  final_test_include_region_metrics: true
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32/best.pt
+  allow_partial_init_checkpoint: false
+  selection_metric: composite_v6_fullpart_fusion_low_rank_80g_fast_eval_remove_inner_disk
+  selection:
+    - - mode
+      - weighted_sum
+    - - name
+      - composite_v6_fullpart_fusion_low_rank_80g_fast_eval_remove_inner_disk
+    - - components
+      - fullpart_stress_miss25_rate: 0.30
+        earpiece_stress_top1_miss25_rate: 0.20
+        earpiece_stress_top5_miss25_rate: 0.25
+        disk_stress_miss25_rate: 0.15
+        earpiece_region_stress_miss25_rate: 0.35
+        earpiece_stress_log_mae: 0.15
+  save_dir: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32_remove_inner_disk

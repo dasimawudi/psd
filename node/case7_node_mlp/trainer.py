@@ -450,11 +450,20 @@ def _resolve_threshold_from_config(
     return float(raw_value or 0.0)
 
 
-def _apply_target_floor(raw_target: torch.Tensor, threshold: float) -> torch.Tensor:
+def _resolve_target_floor_policy(target_cfg: dict[str, Any], feature_schema: dict[str, Any]) -> tuple[float, float]:
+    if "floor_below" in target_cfg:
+        threshold = _resolve_threshold_from_config(target_cfg, feature_schema, "floor_below")
+        if "floor_value" in target_cfg:
+            return threshold, _resolve_threshold_from_config(target_cfg, feature_schema, "floor_value")
+        return threshold, threshold
+    return _resolve_threshold_from_config(target_cfg, feature_schema, "zero_below"), 0.0
+
+
+def _apply_target_floor(raw_target: torch.Tensor, threshold: float, floor_value: float = 0.0) -> torch.Tensor:
     target = raw_target.clamp_min(0.0)
     if threshold <= 0.0:
         return target
-    return torch.where(target < float(threshold), torch.zeros_like(target), target)
+    return torch.where(target < float(threshold), torch.full_like(target, float(floor_value)), target)
 
 
 def _build_point_weights(
@@ -1212,8 +1221,8 @@ def prepare_point_sample(
     features = torch.cat([raw.geometry_features, scaled_features, raw.mask_features], dim=-1)
     schema = feature_schema or {}
     target_config = target_cfg or {}
-    target_floor = _resolve_threshold_from_config(target_config, schema, "zero_below") if schema else 0.0
-    target_raw = _apply_target_floor(raw.target_raw, target_floor)
+    target_floor, target_floor_value = _resolve_target_floor_policy(target_config, schema)
+    target_raw = _apply_target_floor(raw.target_raw, target_floor, target_floor_value)
     target_log = torch.log1p(target_raw).unsqueeze(-1)
     target_scaled = y_scaler.transform(target_log)
     region_masks = None
@@ -1368,9 +1377,10 @@ def _load_scaler_sample(
     dataset_cfg: dict[str, Any],
     feature_cfg: dict[str, Any],
     target_zero_threshold: float,
+    target_floor_value: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, RawPointSample]:
     raw = load_raw_point_sample(sample_path, dataset_cfg=dataset_cfg, feature_cfg=feature_cfg)
-    target_raw = _apply_target_floor(raw.target_raw, target_zero_threshold)
+    target_raw = _apply_target_floor(raw.target_raw, target_zero_threshold, target_floor_value)
     return raw.scaled_features, torch.log1p(target_raw).unsqueeze(-1), raw
 
 
@@ -1596,6 +1606,7 @@ def fit_scalers(
     sample_seed: int = 42,
     prefetch_factor: int = 4,
     target_zero_threshold: float = 0.0,
+    target_floor_value: float = 0.0,
     target_stats: dict[str, float] | None = None,
     logger: Any | None = None,
 ) -> tuple[StandardScaler, StandardScaler, dict[str, Any]]:
@@ -1620,11 +1631,12 @@ def fit_scalers(
 
     if logger is not None:
         logger.info(
-            "Fitting scalers | samples=%s | workers=%s | max_pending=%s | target_zero_threshold=%.6g",
+            "Fitting scalers | samples=%s | workers=%s | max_pending=%s | target_floor_threshold=%.6g | target_floor_value=%.6g",
             len(selected_paths),
             workers,
             max_pending,
             float(target_zero_threshold),
+            float(target_floor_value),
         )
 
     if workers == 1:
@@ -1634,6 +1646,7 @@ def fit_scalers(
                 dataset_cfg=dataset_cfg,
                 feature_cfg=feature_cfg,
                 target_zero_threshold=target_zero_threshold,
+                target_floor_value=target_floor_value,
             )
             for path in selected_paths
         )
@@ -1664,7 +1677,16 @@ def fit_scalers(
                         path = next(path_iter)
                     except StopIteration:
                         return
-                    pending[executor.submit(_load_scaler_sample, path, dataset_cfg, feature_cfg, target_zero_threshold)] = path
+                    pending[
+                        executor.submit(
+                            _load_scaler_sample,
+                            path,
+                            dataset_cfg,
+                            feature_cfg,
+                            target_zero_threshold,
+                            target_floor_value,
+                        )
+                    ] = path
 
             submit_until_full()
             completed = 0
@@ -1710,6 +1732,8 @@ def fit_scalers(
     if target_stats:
         feature_schema.update(target_stats)
     feature_schema["target_zero_threshold"] = float(target_zero_threshold)
+    feature_schema["target_floor_threshold"] = float(target_zero_threshold)
+    feature_schema["target_floor_value"] = float(target_floor_value)
     return x_stats.finalize(), y_stats.finalize(), feature_schema
 
 
@@ -1741,11 +1765,15 @@ def _scaler_cache_matches_schema(
     feature_schema: dict[str, Any],
     current_schema: dict[str, Any],
     target_zero_threshold: float = 0.0,
+    target_floor_value: float = 0.0,
 ) -> bool:
     if feature_schema.get("feature_names") != current_schema.get("feature_names"):
         return False
     cached_target_zero = float(feature_schema.get("target_zero_threshold", 0.0) or 0.0)
     if not math.isclose(cached_target_zero, float(target_zero_threshold), rel_tol=1e-9, abs_tol=1e-12):
+        return False
+    cached_target_floor_value = float(feature_schema.get("target_floor_value", 0.0) or 0.0)
+    if not math.isclose(cached_target_floor_value, float(target_floor_value), rel_tol=1e-9, abs_tol=1e-12):
         return False
     expected_scaled_dim = len(current_schema.get("scaled_continuous_feature_names", []))
     return int(x_scaler.mean.numel()) == expected_scaled_dim
@@ -2597,8 +2625,21 @@ def _weighted_metric_sum(metrics: dict[str, float], selection_cfg: dict[str, Any
     return score
 
 
+def _normalize_selection_config(raw_selection: Any) -> dict[str, Any]:
+    if raw_selection is None:
+        return {}
+    if isinstance(raw_selection, dict):
+        return dict(raw_selection)
+    if isinstance(raw_selection, list):
+        try:
+            return {str(key): value for key, value in raw_selection}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("training.selection list entries must be [key, value] pairs.") from exc
+    raise ValueError("training.selection must be a mapping or a list of [key, value] pairs.")
+
+
 def compute_selection_score(metrics: dict[str, float], training_cfg: dict[str, Any]) -> tuple[str, float]:
-    selection_cfg = dict(training_cfg.get("selection", {}))
+    selection_cfg = _normalize_selection_config(training_cfg.get("selection"))
     if selection_cfg:
         mode = str(selection_cfg.get("mode", "single")).lower()
         if mode in {"weighted_sum", "composite"}:
@@ -2763,8 +2804,10 @@ class NodeMLPTrainer:
             max_values=self.scaler_cfg.get("target_stats_max_values", 2_000_000),
             logger=self.logger,
         )
-        target_zero_threshold = _resolve_threshold_from_config(self.target_cfg, target_stats, "zero_below")
+        target_zero_threshold, target_floor_value = _resolve_target_floor_policy(self.target_cfg, target_stats)
         target_stats["target_zero_threshold"] = float(target_zero_threshold)
+        target_stats["target_floor_threshold"] = float(target_zero_threshold)
+        target_stats["target_floor_value"] = float(target_floor_value)
 
         resolved_dataset = dict(self.dataset_cfg)
         resolved_dataset["split_mode"] = "explicit"
@@ -2783,6 +2826,7 @@ class NodeMLPTrainer:
                 self.feature_schema,
                 current_schema,
                 target_zero_threshold=target_zero_threshold,
+                target_floor_value=target_floor_value,
             ):
                 self.logger.warning("Scaler cache feature schema mismatch; recomputing scalers.")
                 self.x_scaler = None
@@ -2801,6 +2845,7 @@ class NodeMLPTrainer:
                 sample_seed=int(self.scaler_cfg.get("sample_seed", self.training_cfg.get("seed", 42))),
                 prefetch_factor=int(self.scaler_cfg.get("prefetch_factor", 4)),
                 target_zero_threshold=target_zero_threshold,
+                target_floor_value=target_floor_value,
                 target_stats=target_stats,
                 logger=self.logger,
             )
@@ -2971,7 +3016,7 @@ class NodeMLPTrainer:
         selection_label = str(
             self.training_cfg.get(
                 "selection_metric",
-                dict(self.training_cfg.get("selection", {})).get("name", "earpiece_stress_log_mae"),
+                _normalize_selection_config(self.training_cfg.get("selection")).get("name", "earpiece_stress_log_mae"),
             )
         )
         best_score = float("inf")

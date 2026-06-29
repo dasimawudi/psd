@@ -469,6 +469,19 @@ def _build_disk_center_region_mask(nodes_df: pd.DataFrame) -> np.ndarray:
     return _combined_node_mask(nodes_df, ("center_couple_mask", "center_node_mask"))
 
 
+def _build_inner_disk_to_plate_hole_outer_edge_mask(nodes_df: pd.DataFrame, payload: dict[str, Any]) -> np.ndarray:
+    fixed_geometry = _load_fixed_geometry(payload)
+    cutoff_radius = max(
+        float(fixed_geometry["plate_HoleDist"]) + float(fixed_geometry["plate_HoleRadius"]),
+        0.0,
+    )
+    if cutoff_radius <= 0.0 or "x" not in nodes_df.columns or "y" not in nodes_df.columns:
+        return np.zeros(len(nodes_df), dtype=bool)
+    x = nodes_df["x"].to_numpy(dtype=np.float64, copy=False)
+    y = nodes_df["y"].to_numpy(dtype=np.float64, copy=False)
+    return np.sqrt(np.square(x) + np.square(y)) <= cutoff_radius
+
+
 def _pointset_cache_key(pointset_cfg: dict[str, Any] | None) -> str:
     return json.dumps(pointset_cfg or {}, sort_keys=True, separators=(",", ":"))
 
@@ -568,6 +581,8 @@ def _build_node_scope_mask(
             mask &= _build_boundary_mask(nodes_df, payload) <= 0.5
     if bool(dataset_cfg.get("exclude_center_node", False)):
         mask &= ~_node_mask_values(nodes_df, "center_node_mask")
+    if bool(dataset_cfg.get("exclude_inner_disk_to_plate_hole_outer_edge", False)):
+        mask &= ~_build_inner_disk_to_plate_hole_outer_edge_mask(nodes_df, payload)
 
     pointset_cfg = dataset_cfg.get("pointset") or dataset_cfg.get("pointset_filter")
     mask &= _build_pointset_mask(nodes_df, case_name=case_name, pointset_cfg=pointset_cfg)
