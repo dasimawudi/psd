@@ -1,0 +1,4 @@
+展示编号,原始样本名,节点数,逐频点数,frequency_point_within25_pct,node_aggregate_relative_mae_pct,node_mean_mae_within25_pct,node_aggregate_p90_pct,node_aggregate_p95_pct,node_aggregate_max_pct
+代表样本 1,case843_mises_full_export,13337,1004942,85.24,16.78,86.65,29.99,46.38,12512.18
+代表样本 2,case228_mises_full_export,12948,971933,85.28,16.30,87.26,28.89,43.97,3002.90
+代表样本 3,case18_mises_full_export,13278,1490042,89.69,11.30,92.86,20.80,31.21,4327.54

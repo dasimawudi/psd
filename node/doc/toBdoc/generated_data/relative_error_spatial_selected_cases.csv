@@ -1,0 +1,4 @@
+展示编号,原始样本名,节点数,overall_within25_pct,overall_relative_mae_pct,relative_error_gt50_pct,relative_error_p90_pct,relative_error_p95_pct,relative_error_max_pct
+代表样本 1,case843_mises_full_export,13337,92.44,10.39,2.72,21.26,32.12,1443.72
+代表样本 2,case228_mises_full_export,12948,92.39,10.43,2.63,21.35,33.27,789.42
+代表样本 3,case18_mises_full_export,13278,92.11,10.51,2.29,21.72,32.01,923.44
