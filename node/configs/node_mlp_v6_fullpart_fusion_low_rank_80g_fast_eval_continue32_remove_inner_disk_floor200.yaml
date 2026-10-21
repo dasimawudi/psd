@@ -1,0 +1,31 @@
+base_config: node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32_remove_inner_disk.yaml
+
+target:
+  # Experiment: clamp background-like low stress targets upward instead of zeroing them.
+  # Values below 200 are trained/evaluated as exactly 200.
+  floor_below: 200.0
+  floor_value: 200.0
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_remove_inner_disk_floor200_scalers.pt
+  target_stats_cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_remove_inner_disk_floor200_scalers.pt
+  overwrite_cache: true
+  reuse_target_stats_from_cache: false
+
+training:
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32_remove_inner_disk/best.pt
+  allow_partial_init_checkpoint: false
+  selection_metric: composite_v6_fullpart_fusion_low_rank_80g_fast_eval_remove_inner_disk_floor200
+  selection:
+    - - mode
+      - weighted_sum
+    - - name
+      - composite_v6_fullpart_fusion_low_rank_80g_fast_eval_remove_inner_disk_floor200
+    - - components
+      - fullpart_stress_miss25_rate: 0.30
+        earpiece_stress_top1_miss25_rate: 0.20
+        earpiece_stress_top5_miss25_rate: 0.25
+        disk_stress_miss25_rate: 0.15
+        earpiece_region_stress_miss25_rate: 0.35
+        earpiece_stress_log_mae: 0.15
+  save_dir: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32_remove_inner_disk_floor200

@@ -1,0 +1,77 @@
+dataset:
+  root: .cache/mises_psd_next1000_full_export_step0p5_balanced_v1
+  sample_mode: per_frequency
+  include_zero_frequency: false
+  min_frequency_hz: 20.0
+  max_frequency_hz: 2000.0
+  split_mode: ratio
+  split_seed: 42
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  earpiece_region:
+    enabled: true
+    type: earpiece
+    width_scale: 1.5
+
+features:
+  use_psd: true
+  include_psd_value_at_frequency: true
+  include_log_psd_value_at_frequency: true
+  use_mode_shapes: true
+  mode_shape_columns: [U1, U2, U3, U_mag]
+  mode_shape_count: 10
+  mode_shape_normalization: max_umag
+  mode_shape_weighting: resonance
+  mode_shape_damping_ratio: 0.02
+  mode_shape_modal_frequency_power: 2.0
+
+graph:
+  # Uses real mesh connectivity from each case's edges.csv, then keeps only earpiece-region valid nodes.
+  edge_attr: [dx, dy, dz, dist]
+  add_reverse: true
+  add_self_loops: true
+  standardize_per_graph: true
+
+target:
+  zero_below: "p99*1e-8"
+
+loss:
+  weighting: target_quantile
+  top5_weight: 3.0
+  top1_weight: 8.0
+
+scaler:
+  num_workers: 8
+  sample_seed: 42
+  prefetch_factor: 4
+  # Same node features and target transform as the weighted-tail MLP v2, so this cache can be reused.
+  cache_path: node/cache/node_mlp_earpiece_case1000_v2_weighted_tail_scalers.pt
+  target_stats_max_values: 2000000
+
+model:
+  hidden_dim: 128
+  num_layers: 2
+  heads: 4
+  activation: silu
+  dropout: 0.10
+  layer_norm: true
+  beta: true
+
+training:
+  seed: 42
+  device: auto
+  epochs: 30
+  lr: 0.0005
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  graph_batch_size: 1
+  num_workers: 8
+  shuffle_samples: false
+  eval_every: 1
+  eval_progress_every_steps: 50
+  write_diagnostics: true
+  early_stopping_patience: 8
+  progress_every_steps: 50
+  selection_metric: earpiece_stress_log_mae
+  save_dir: node/outputs/node_transformerconv_earpiece_case1000_v1

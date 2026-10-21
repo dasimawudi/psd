@@ -32,3 +32,6 @@ Thumbs.db
 # Local datasets and large artifacts
 case7/
 case7.zip
+
+.cache/
+node/cache/

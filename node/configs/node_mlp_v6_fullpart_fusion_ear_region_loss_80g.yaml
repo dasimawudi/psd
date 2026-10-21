@@ -1,0 +1,42 @@
+base_config: node_mlp_v6_fullpart_fusion_low_rank_80g.yaml
+
+loss:
+  earpiece_region_point_weight: 2.0
+  earpiece_region_top_quantile: 0.95
+  earpiece_region_min_target: 0.0
+  earpiece_top5_loss_weight: 0.25
+  earpiece_top1_loss_weight: 0.45
+  earpiece_top5_under_weight: 0.05
+  earpiece_top1_under_weight: 0.12
+  earpiece_under_margin_log: 0.09531018
+  earpiece_top5_quantile: 0.95
+  earpiece_top1_quantile: 0.99
+  earpiece_min_points: 1
+  earpiece_min_target: 0.0
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_scalers.pt
+  overwrite_cache: false
+
+training:
+  epochs: 30
+  lr: 0.00004
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_fusion_ear_region_loss_80g/init_from_fusion_epoch8_best.pt
+  aux_init_checkpoints: []
+  early_stopping_patience: 8
+  selection_metric: composite_v6_fullpart_fusion_ear_region_loss_80g
+  selection:
+    mode: weighted_sum
+    name: composite_v6_fullpart_fusion_ear_region_loss_80g
+    components:
+      fullpart_stress_miss25_rate: 0.18
+      fullpart_stress_top1_miss25_rate: 0.15
+      fullpart_stress_top5_miss25_rate: 0.18
+      disk_center_stress_top1_miss25_rate: 0.22
+      disk_center_stress_top5_miss25_rate: 0.18
+      earpiece_region_stress_miss25_rate: 0.25
+      earpiece_region_stress_top1_miss25_rate: 0.55
+      earpiece_region_stress_top5_miss25_rate: 0.35
+      earpiece_region_stress_top1_log_mae: 0.12
+      earpiece_stress_log_mae: 0.10
+  save_dir: node/outputs/node_mlp_v6_fullpart_fusion_ear_region_loss_80g

@@ -1,0 +1,201 @@
+base_config: node_mlp_v6_fullpart_disk_center_opt.yaml
+
+features:
+  include_disk_center_band_features: true
+  disk_center_inner_radius_mm: 3.0
+  disk_center_outer_radius_mm: 12.0
+  disk_center_ring_softness_mm: 1.0
+  include_disk_center_rbf_features: true
+  disk_center_rbf_count: 8
+  disk_center_rbf_bandwidth_ratio: 0.14
+  include_disk_center_modal_region_features: true
+  disk_center_modal_region_feature_keys:
+    - nearest_umag
+    - weighted_umag_frf
+    - weighted_grad_umag_max_frf
+
+loss:
+  sample_peak_loss_weight: 0.22
+  sample_top5_loss_weight: 0.18
+  sample_top1_loss_weight: 0.30
+  disk_center_top5_loss_weight: 0.18
+  disk_center_top1_loss_weight: 0.32
+  disk_center_top5_under_weight: 0.02
+  disk_center_top1_under_weight: 0.04
+  disk_center_under_margin_log: 0.09531018
+  center_region_point_weight: 1.6
+  center_region_top_quantile: 0.95
+  participation_residual_weight: 0.0
+  center_curve_consistency_weight: 0.02
+  center_curve_consistency_top_fraction: 0.08
+  center_curve_consistency_min_points: 8
+  center_curve_consistency_min_frequencies: 4
+  center_curve_consistency_max_nodes: 128
+
+scaler:
+  num_workers: 16
+  sample_seed: 42
+  prefetch_factor: 2
+  sample_limit: 1024
+  cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_scalers.pt
+  target_stats_cache_path: node/cache/node_mlp_v6_fullpart_disk_center_scalers.pt
+  overwrite_cache: true
+  reuse_target_stats_from_cache: true
+  target_stats_max_values: 2000000
+
+model:
+  low_rank_curve_head: true
+  curve_rank: 8
+  residual_weight: 0.15
+  curve_frequency_feature_patterns:
+    - earpiece_thickness
+    - earpiece_RadialDist
+    - earpiece_TopWidth
+    - earpiece_HoleTopDist
+    - earpiece_TopFilletRadius
+    - earpiece_BottomFilletRadius
+    - earpiece_HoleRadius
+    - earpiece_width_over_plate_radius
+    - earpiece_width_over_hole_radius
+    - plate_radius
+    - Add_mass
+    - plate_thickness
+    - mass_couple_radius
+    - psd_
+    - psd_value_at_frequency
+    - log_psd_value_at_frequency
+    - frequency
+    - log_frequency
+    - freq_top
+    - signed_delta_to_mode
+    - abs_delta_to_mode
+    - nearest_delta
+    - first_mode_ratio
+    - freq_ratio_mode_
+    - modal_detuning_mode_
+    - nearest_freq_ratio
+    - nearest_modal_detuning
+    - log_modal_amp_
+    - modal_weight_
+    - nearest_log_modal_amp_
+    - sum_log_modal_amp_
+    - top3_log_modal_amp_sum_
+    - nearest_modal_weight_
+    - log_modal_gain_frf
+    - modal_weight_frf
+    - freq_ratio_frf
+  curve_frequency_feature_exclude_patterns:
+    - x_norm
+    - y_norm
+    - z_norm
+    - r_norm
+    - dist_to_
+    - ear_local_
+    - near_
+    - mask
+    - weighted_
+    - nearest_abs_
+    - nearest_umag
+    - nearest_gap
+    - nearest_weight
+    - active1_abs_
+    - active2_abs_
+    - active3_abs_
+    - active1_umag
+    - active2_umag
+    - active3_umag
+    - active1_grad_
+    - active2_grad_
+    - active3_grad_
+    - shape_rms
+    - modal_baseline_log_
+  curve_node_feature_patterns:
+    - _norm
+    - dist_to_
+    - sin_theta
+    - cos_theta
+    - center_
+    - center_inner
+    - center_mid
+    - center_outer
+    - center_region_rbf_
+    - plate_hole
+    - ear_local_
+    - near_ear_
+    - near_hole_
+    - root
+    - bridge
+    - hole_center
+    - stress_region
+    - weighted_abs_
+    - weighted_umag
+    - nearest_abs_
+    - nearest_umag
+    - weighted_grad_
+    - nearest_grad_
+    - active1_abs_
+    - active2_abs_
+    - active3_abs_
+    - active1_umag
+    - active2_umag
+    - active3_umag
+    - active1_grad_
+    - active2_grad_
+    - active3_grad_
+    - modal_baseline_log_
+    - shape_rms
+    - mask
+
+training:
+  epochs: 80
+  lr: 0.00006
+  batch_size: 4000000
+  sample_batch_size: 384
+  num_workers: 4
+  persistent_workers: false
+  prefetch_factor: 1
+  pin_memory: true
+  eval_every: 1
+  eval_topk_mode: full
+  eval_include_region_metrics: true
+  test_on_best: false
+  final_test_after_training: true
+  final_test_topk_mode: full
+  final_test_include_region_metrics: true
+  write_diagnostics: false
+  early_stopping_patience: 10
+  progress_every_steps: 5
+  eval_progress_every_steps: 5
+  init_checkpoint: node/outputs/node_mlp_v6_disk_center_low_rank_curves_fast_eval_continue70_4m/best.pt
+  allow_partial_init_checkpoint: true
+  aux_init_checkpoints:
+    - path: node/outputs/node_mlp_v5_exp_region_distance_within25_50ep/best.pt
+      blend: 0.35
+      feature_patterns:
+        - earpiece
+        - ear_
+        - ear_local_
+        - near_ear
+        - near_hole
+        - root
+        - bridge
+        - dist_to_ear
+        - ear_connection
+        - stress_region
+        - weighted_grad
+        - nearest_grad
+        - modal_baseline
+  selection_metric: composite_v6_fullpart_fusion_low_rank_80g
+  selection:
+    mode: weighted_sum
+    name: composite_v6_fullpart_fusion_low_rank_80g
+    components:
+      fullpart_stress_miss25_rate: 0.25
+      fullpart_stress_top1_miss25_rate: 0.18
+      fullpart_stress_top5_miss25_rate: 0.22
+      disk_center_stress_top1_miss25_rate: 0.30
+      disk_center_stress_top5_miss25_rate: 0.25
+      earpiece_region_stress_top1_miss25_rate: 0.35
+      earpiece_region_stress_top5_miss25_rate: 0.25
+      earpiece_stress_log_mae: 0.15
+  save_dir: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g

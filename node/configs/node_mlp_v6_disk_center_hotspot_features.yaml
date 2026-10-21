@@ -1,0 +1,22 @@
+base_config: node_mlp_v6_disk_center_baseline.yaml
+
+features:
+  include_disk_center_band_features: true
+  disk_center_inner_radius_mm: 3.0
+  disk_center_outer_radius_mm: 12.0
+  disk_center_ring_softness_mm: 1.0
+  include_disk_center_rbf_features: true
+  disk_center_rbf_count: 8
+  disk_center_rbf_bandwidth_ratio: 0.14
+  include_disk_center_modal_region_features: true
+  disk_center_modal_region_feature_keys:
+    - nearest_umag
+    - weighted_umag_frf
+    - weighted_grad_umag_max_frf
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_disk_center_hotspot_features_scalers.pt
+
+training:
+  init_checkpoint: node/outputs/node_mlp_v6_disk_center_baseline/best.pt
+  save_dir: node/outputs/node_mlp_v6_disk_center_hotspot_features

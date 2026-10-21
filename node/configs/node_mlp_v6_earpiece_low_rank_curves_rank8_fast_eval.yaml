@@ -1,0 +1,8 @@
+base_config: node_mlp_v6_earpiece_low_rank_curves_fast_eval.yaml
+
+model:
+  curve_rank: 8
+  residual_weight: 0.20
+
+training:
+  save_dir: node/outputs/node_mlp_v6_earpiece_low_rank_curves_rank8_fast_eval_yolo

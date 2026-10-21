@@ -1,0 +1,17 @@
+base_config: node_mlp_v6_disk_center_baseline.yaml
+
+features:
+  use_mode_shapes: false
+  include_shape_normalized_mode_features: false
+  include_modal_ratio_features: false
+  include_modal_frf_features: false
+  include_modal_frf_shape_features: false
+  include_modal_gradient_features: false
+  include_modal_baseline_feature: false
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_disk_center_no_modal_frf_scalers.pt
+
+training:
+  init_checkpoint: node/outputs/node_mlp_v6_fullpart_disk_center/best.pt
+  save_dir: node/outputs/node_mlp_v6_disk_center_ablation_no_modal_frf

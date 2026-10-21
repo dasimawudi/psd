@@ -1,0 +1,19 @@
+base_config: node_mlp_v6_earpiece_low_rank_curves_rank8_fast_eval.yaml
+
+loss:
+  censored_background_weight: 0.08
+  censored_background_target_max: 100.0
+  censored_background_pred_ceiling: 100.0
+  censored_background_margin_log: 0.22314355
+  rank_band_balanced_weight: 0.06
+  rank_band_balanced_bands:
+    - {left: 0.00, right: 0.01, weight: 1.0}
+    - {left: 0.01, right: 0.05, weight: 1.0}
+    - {left: 0.05, right: 0.10, weight: 1.0}
+    - {left: 0.10, right: 0.25, weight: 1.0}
+    - {left: 0.25, right: 0.50, weight: 1.0}
+    - {left: 0.50, right: 1.00, weight: 1.35}
+
+training:
+  save_dir: node/outputs/node_mlp_v6_earpiece_low_rank_curves_rank8_censored_bg_gpu7
+  epochs: 40

@@ -1,0 +1,25 @@
+Manual PR request
+=================
+
+Target repository: https://github.com/dasimawudi/psd
+Target branch: main
+Source branch to push from fork: best/disk-center-region
+Source commit: 7748c32dea644207eac83d4edbea5a378a1b6300
+
+Commits included over origin/main:
+
+7748c32 Organize best region model branches
+f5eadd2 Add disk center optimization and results summary
+4d82c7c Add disk center region diagnostics
+b24174a Add node training code and model results summary
+
+PR title:
+Organize best region model branches and disk-center baseline
+
+Use pr_artifacts/PR_BODY.md as the PR body.
+
+Prepared artifacts:
+- pr_artifacts/best-region-model-branches.patch
+- pr_artifacts/best-disk-center-region.bundle
+- pr_artifacts/PR_BODY.md
+- pr_artifacts/PR_STEPS.md

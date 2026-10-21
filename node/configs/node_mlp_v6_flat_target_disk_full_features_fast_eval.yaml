@@ -1,0 +1,11 @@
+base_config: node_mlp_v6_flat_target_full_features_base.yaml
+
+dataset:
+  node_scope: disk_region
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_flat_target_disk_full_features_fast_eval_scalers.pt
+
+training:
+  selection_metric: earpiece_stress_log_mae
+  save_dir: node/outputs/node_mlp_v6_flat_target_disk_full_features_fast_eval

@@ -1,0 +1,10 @@
+base_config: node_mlp_v6_disk_center_low_rank_curves_fast_eval.yaml
+
+training:
+  epochs: 70
+  init_checkpoint: node/outputs/node_mlp_v6_disk_center_low_rank_curves_fast_eval/best.pt
+  save_dir: node/outputs/node_mlp_v6_disk_center_low_rank_curves_fast_eval_continue70
+  test_on_best: false
+  final_test_after_training: true
+  final_test_topk_mode: full
+  final_test_include_region_metrics: true

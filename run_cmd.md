@@ -1,0 +1,1 @@
+PYTHONPATH=node conda run -n ci2n python node/plot_disk_center_p1_within25.py --plot-only
