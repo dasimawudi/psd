@@ -19,6 +19,7 @@ scaler:
   reuse_target_stats_from_cache: true
 
 training:
+  # num_workers inherited from base (A): conservative = 2 per experiment.
   selection_metric: composite_v6_fullpart_fusion_low_rank_80g_fast_eval_remove_inner_disk_floor200_no_modal_distill
   selection:
     - - mode

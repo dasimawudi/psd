@@ -10,13 +10,14 @@ scaler:
   target_stats_cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_remove_inner_disk_floor200_no_modal_scalers.pt
   overwrite_cache: false
   reuse_target_stats_from_cache: true
-  num_workers: 4
+  num_workers: 2
   sample_limit: 1024
   prefetch_factor: 2
 
 training:
   epochs: 100
-  num_workers: 4
+  # Conservative CPU usage: machine is shared/heavily loaded by other users.
+  num_workers: 2
   persistent_workers: true
   prefetch_factor: 2
   eval_num_workers: 1
