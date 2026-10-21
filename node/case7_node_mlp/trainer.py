@@ -2106,6 +2106,9 @@ def train_one_epoch(
     logger: Any | None = None,
     epoch: int | None = None,
     progress_every_steps: int = 50,
+    teacher: torch.nn.Module | None = None,
+    distill_weight: float = 0.0,
+    student_feature_indices: list[int] | None = None,
 ) -> dict[str, float]:
     model.train()
     totals = _empty_point_metric_totals()
@@ -2125,10 +2128,18 @@ def train_one_epoch(
             continue
         host_chunks = _point_chunks(host_batch, point_batch_size=point_batch_size, shuffle=True)
         for chunk in host_chunks:
-            features = host_batch.features[chunk].to(device, non_blocking=True)
+            features_full = host_batch.features[chunk].to(device, non_blocking=True)
             target = host_batch.target_scaled[chunk].to(device, non_blocking=True)
             weights = host_batch.point_weights[chunk].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
+            if teacher is not None and student_feature_indices is not None:
+                with torch.no_grad():
+                    teacher_output = teacher(features_full)
+                teacher_pred = regression_output(teacher_output)
+                features = features_full[:, student_feature_indices]
+            else:
+                teacher_pred = None
+                features = features_full
             output = model(features)
             prediction = regression_output(output)
             loss_values = F.smooth_l1_loss(prediction, target, reduction="none").squeeze(-1)
@@ -2242,6 +2253,12 @@ def train_one_epoch(
                         y_scaler=y_scaler,
                     )
                 loss = loss + aux_loss + low_target_loss + censored_background_loss + rank_loss
+            if teacher_pred is not None and distill_weight > 0.0:
+                pred_log = y_scaler.inverse_transform(prediction)
+                teacher_log = y_scaler.inverse_transform(teacher_pred)
+                distill_values = F.smooth_l1_loss(pred_log, teacher_log, reduction="none").squeeze(-1)
+                distill_term = (distill_values * weights).sum() / weights.sum().clamp_min(1e-12)
+                loss = loss + float(distill_weight) * distill_term
             loss.backward()
             if grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -2726,6 +2743,8 @@ class NodeMLPTrainer:
         self.scaler_cfg = dict(config.get("scaler", {}))
         self.target_cfg = dict(config.get("target", {}))
         self.loss_cfg = dict(config.get("loss", {}))
+        self.distill_cfg = dict(config.get("distill", {}) or {})
+        self.distill_enabled = bool(self.distill_cfg.get("enabled", False))
 
         self.save_dir = ensure_dir(self.training_cfg["save_dir"])
         self.logger = make_logger(self.save_dir, logger_name="case7_node_mlp")
@@ -2742,6 +2761,8 @@ class NodeMLPTrainer:
         self.model: torch.nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.resolved_config: dict[str, Any] = {}
+        self.teacher: torch.nn.Module | None = None
+        self.student_feature_indices: list[int] | None = None
 
         self._prepare()
 
@@ -2864,8 +2885,40 @@ class NodeMLPTrainer:
                         "Not saving recomputed scaler cache because scaler.overwrite_cache is false: %s",
                         scaler_cache_path,
                     )
-        input_dim = int(self.feature_schema["input_dim"])
-        self.model = build_model(self.config, input_dim=input_dim, feature_schema=self.feature_schema).to(self.device)
+        if self.distill_enabled:
+            student_feature_cfg = dict(self.feature_cfg)
+            student_feature_cfg["use_mode_shapes"] = False
+            student_feature_cfg["include_modal_frequency_features"] = False
+            student_schema = _probe_current_feature_schema(
+                self.train_sample_paths, self.dataset_cfg, student_feature_cfg
+            )
+            student_names = [str(name) for name in student_schema.get("feature_names", [])]
+            full_names = [str(name) for name in self.feature_schema.get("feature_names", [])]
+            name_to_index = {name: idx for idx, name in enumerate(full_names)}
+            missing = [name for name in student_names if name not in name_to_index]
+            if missing:
+                raise ValueError(f"Student features missing from full schema: {missing}")
+            self.student_feature_indices = [name_to_index[name] for name in student_names]
+            student_schema["input_dim"] = len(student_names)
+            self.model = build_model(
+                self.config, input_dim=len(student_names), feature_schema=student_schema
+            ).to(self.device)
+            teacher_path = Path(str(self.distill_cfg["teacher_checkpoint"]))
+            if not teacher_path.exists():
+                raise FileNotFoundError(f"distill.teacher_checkpoint does not exist: {teacher_path}")
+            self.logger.info("Loading distillation teacher: %s", teacher_path)
+            teacher_checkpoint = torch.load(teacher_path, map_location="cpu")
+            teacher = build_model(
+                self.config,
+                input_dim=int(self.feature_schema["input_dim"]),
+                feature_schema=self.feature_schema,
+            ).to(self.device)
+            teacher.load_state_dict(teacher_checkpoint["model_state"])
+            teacher.eval()
+            self.teacher = teacher
+        else:
+            input_dim = int(self.feature_schema["input_dim"])
+            self.model = build_model(self.config, input_dim=input_dim, feature_schema=self.feature_schema).to(self.device)
         init_checkpoint = self.training_cfg.get("init_checkpoint")
         if init_checkpoint:
             checkpoint_path = Path(str(init_checkpoint))
@@ -3065,6 +3118,9 @@ class NodeMLPTrainer:
                 logger=self.logger,
                 epoch=epoch,
                 progress_every_steps=progress_every_steps,
+                teacher=self.teacher,
+                distill_weight=float(self.distill_cfg.get("weight", 0.5)) if self.distill_enabled else 0.0,
+                student_feature_indices=self.student_feature_indices,
             )
             train_loss = float(train_metrics["loss"])
             history_row: dict[str, Any] = {"epoch": epoch, "train_loss": round(float(train_loss), 8)}
