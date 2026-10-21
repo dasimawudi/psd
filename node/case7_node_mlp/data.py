@@ -1774,39 +1774,38 @@ def _build_base_features(
 
     current_frequency = torch.tensor([float(frequency_hz)], dtype=torch.float32)
     safe_frequency = current_frequency.clamp_min(1e-6)
-    modes = freq_top3.clamp_min(1e-6)
-    signed_delta = (safe_frequency - modes) / modes
-    abs_delta = signed_delta.abs()
-    frequency_values = torch.cat(
-        [
-            current_frequency,
-            safe_frequency.log(),
-            freq_top3,
-            signed_delta,
-            abs_delta,
-            abs_delta.min().reshape(1),
-            safe_frequency / modes[:1],
-        ],
-        dim=0,
-    )
-    scaled_parts.append(frequency_values.unsqueeze(0).expand(node_count, -1))
-    scaled_names.extend(
-        [
-            "frequency",
-            "log_frequency",
-            "freq_top1",
-            "freq_top2",
-            "freq_top3",
-            "signed_delta_to_mode_1",
-            "signed_delta_to_mode_2",
-            "signed_delta_to_mode_3",
-            "abs_delta_to_mode_1",
-            "abs_delta_to_mode_2",
-            "abs_delta_to_mode_3",
-            "nearest_delta",
-            "first_mode_ratio",
-        ]
-    )
+    frequency_parts = [current_frequency, safe_frequency.log()]
+    frequency_names = ["frequency", "log_frequency"]
+    if bool(feature_cfg.get("include_modal_frequency_features", True)):
+        modes = freq_top3.clamp_min(1e-6)
+        signed_delta = (safe_frequency - modes) / modes
+        abs_delta = signed_delta.abs()
+        frequency_parts.extend(
+            [
+                freq_top3,
+                signed_delta,
+                abs_delta,
+                abs_delta.min().reshape(1),
+                safe_frequency / modes[:1],
+            ]
+        )
+        frequency_names.extend(
+            [
+                "freq_top1",
+                "freq_top2",
+                "freq_top3",
+                "signed_delta_to_mode_1",
+                "signed_delta_to_mode_2",
+                "signed_delta_to_mode_3",
+                "abs_delta_to_mode_1",
+                "abs_delta_to_mode_2",
+                "abs_delta_to_mode_3",
+                "nearest_delta",
+                "first_mode_ratio",
+            ]
+        )
+    scaled_parts.append(torch.cat(frequency_parts, dim=0).unsqueeze(0).expand(node_count, -1))
+    scaled_names.extend(frequency_names)
 
     mode_features, mode_names = _build_mode_shape_features(
         case_dir=Path(str(payload.get("__case_dir__", ""))),
