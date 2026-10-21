@@ -1,0 +1,41 @@
+base_config: node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32_remove_inner_disk_floor200.yaml
+
+features:
+  # Inference-time only: no modal analysis. Drop 178 modal node features + 11 modal-frequency features.
+  use_mode_shapes: false
+  include_modal_frequency_features: false
+
+scaler:
+  cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_remove_inner_disk_floor200_no_modal_scalers.pt
+  target_stats_cache_path: node/cache/node_mlp_v6_fullpart_fusion_low_rank_80g_remove_inner_disk_floor200_no_modal_scalers.pt
+  overwrite_cache: false
+  reuse_target_stats_from_cache: true
+  num_workers: 4
+  sample_limit: 1024
+  prefetch_factor: 2
+
+training:
+  epochs: 100
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  eval_num_workers: 1
+  eval_prefetch_factor: 1
+  # 89-dim student: cannot continue from the 278-dim floor200 checkpoint.
+  init_checkpoint: null
+  allow_partial_init_checkpoint: false
+  aux_init_checkpoints: []
+  selection_metric: composite_v6_fullpart_fusion_low_rank_80g_fast_eval_remove_inner_disk_floor200_no_modal
+  selection:
+    - - mode
+      - weighted_sum
+    - - name
+      - composite_v6_fullpart_fusion_low_rank_80g_fast_eval_remove_inner_disk_floor200_no_modal
+    - - components
+      - fullpart_stress_miss25_rate: 0.30
+        earpiece_stress_top1_miss25_rate: 0.20
+        earpiece_stress_top5_miss25_rate: 0.25
+        disk_stress_miss25_rate: 0.15
+        earpiece_region_stress_miss25_rate: 0.35
+        earpiece_stress_log_mae: 0.15
+  save_dir: node/outputs/node_mlp_v6_fullpart_fusion_low_rank_80g_fast_eval_continue32_remove_inner_disk_floor200_no_modal
